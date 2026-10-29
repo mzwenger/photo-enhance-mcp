@@ -118,14 +118,29 @@ def _load(path: str) -> np.ndarray:
     return cv2.cvtColor(np.asarray(im), cv2.COLOR_RGB2BGR)
 
 
+EDITED = "mejoradas"  # subcarpeta donde va todo lo que se genera; los originales no se tocan
+
+
+def _edited_dir(src_dir, edited_dir: str | None = None) -> Path:
+    """Carpeta de salida: la indicada o <carpeta de originales>/mejoradas (se crea)."""
+    src_dir = Path(src_dir).expanduser()
+    dst = Path(edited_dir).expanduser() if edited_dir else src_dir / EDITED
+    if dst.resolve() == src_dir.resolve():
+        raise ValueError("La carpeta de salida no puede ser la de los originales")
+    dst.mkdir(parents=True, exist_ok=True)
+    return dst
+
+
 def _out_path(src: str, suffix: str, output_path: str | None, ext: str | None = None) -> Path:
+    """Por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo>; si la foto ya está en una
+    carpeta mejoradas (se edita una versión editada), queda en esa misma carpeta."""
     if output_path:
         out = Path(output_path).expanduser()
-    else:
-        s = Path(src).expanduser()
-        out = s.with_name(f"{s.stem}_{suffix}{ext or s.suffix or '.png'}")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    return out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        return out
+    s = Path(src).expanduser()
+    folder = s.parent if s.parent.name == EDITED else _edited_dir(s.parent)
+    return folder / f"{s.stem}_{suffix}{ext or s.suffix or '.png'}"
 
 
 def _save(img: np.ndarray, out: Path) -> None:
@@ -230,6 +245,9 @@ def auto_enhance(path: str, strength: float = 1.0, output_path: str | None = Non
     """Mejora automática: balance de blancos, contraste local, color y nitidez.
 
     strength: 0.0 a 2.0 (1.0 = moderado).
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     img = _enhance(_load(path), float(np.clip(strength, 0, 2)))
     out = _out_path(path, "enhanced", output_path)
@@ -242,7 +260,11 @@ def adjust(path: str, brightness: float = 0, contrast: float = 0, saturation: fl
            warmth: float = 0, gamma: float = 1.0, sharpness: float = 0,
            output_path: str | None = None):
     """Ajustes manuales. brightness/contrast/saturation/warmth en -100..100,
-    gamma 0.3..3 (<1 aclara sombras), sharpness 0..100."""
+    gamma 0.3..3 (<1 aclara sombras), sharpness 0..100.
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
+    """
     p = _params(dict(brightness=brightness, contrast=contrast, saturation=saturation, warmth=warmth,
                      gamma=gamma, sharpness=sharpness))
     img = _adjust(_load(path), p["brightness"], p["contrast"], p["saturation"], p["warmth"], p["gamma"],
@@ -254,7 +276,11 @@ def adjust(path: str, brightness: float = 0, contrast: float = 0, saturation: fl
 
 @_tool
 def denoise(path: str, strength: int = 7, output_path: str | None = None):
-    """Reduce el ruido digital conservando bordes. strength 3..20 (7 = moderado)."""
+    """Reduce el ruido digital conservando bordes. strength 3..20 (7 = moderado).
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
+    """
     img = _load(path)
     s = int(np.clip(strength, 3, 20))
     img = cv2.fastNlMeansDenoisingColored(img, None, s, s, 7, 21)
@@ -268,6 +294,9 @@ def upscale(path: str, scale: int = 4, style: str = "photo", output_path: str | 
     """Aumenta la resolución con Real-ESRGAN (en la GPU vía Vulkan).
 
     scale: 2, 3 o 4. style: "photo" o "anime" (ilustraciones/dibujos).
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     scale = int(scale)
     if scale not in (2, 3, 4):
@@ -296,7 +325,11 @@ def upscale(path: str, scale: int = 4, style: str = "photo", output_path: str | 
 @_tool
 def remove_background(path: str, background: str | None = None, output_path: str | None = None):
     """Quita el fondo (rembg/ISNet). Sin background deja PNG transparente;
-    background acepta un color hex como "#ffffff"."""
+    background acepta un color hex como "#ffffff".
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
+    """
     from rembg import new_session, remove
     with _load_lock:
         if "isnet" not in _rembg_sessions:
@@ -349,6 +382,9 @@ def remove_objects(path: str, boxes: list[list[int]] | None = None, mask_path: s
 
     boxes: rectángulos [x, y, ancho, alto] en píxeles de la imagen original
     (usá image_info para ver tamaño). O mask_path: imagen blanca donde borrar.
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     img = _load(path)
     H, W = img.shape[:2]
@@ -383,6 +419,9 @@ def restore_faces(path: str, fidelity: float = 0.7, output_path: str | None = No
     """Restaura caras borrosas, pixeladas o de fotos viejas (GFPGAN 1.4).
 
     fidelity: 0..1, mezcla con la cara original (1 = solo resultado de IA).
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     img = _load(path)
     H, W = img.shape[:2]
@@ -430,6 +469,9 @@ def transform(path: str, crop: list[int] | None = None, width: int | None = None
     crop: [x, y, ancho, alto]. width/height: si das solo uno se mantiene la
     proporción. rotate: grados antihorario. flip: "h" o "v".
     format: "jpg", "png" o "webp".
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     img = _load(path)
     if crop:
@@ -561,15 +603,17 @@ show(0);
 
 
 @_tool
-def compare_gallery(original_dir: str, edited_dir: str, output_dir: str | None = None,
+def compare_gallery(original_dir: str, edited_dir: str | None = None, output_dir: str | None = None,
                     max_side: int = 1600):
     """Crea una página HTML para recorrer y comparar todas las fotos originales con sus
     versiones editadas (mismo nombre de archivo) con un deslizador antes/después.
+    edited_dir: por defecto <original_dir>/mejoradas.
 
     output_dir: carpeta donde se escribe index.html y las miniaturas
     (por defecto <edited_dir>/comparacion). max_side: tamaño de las miniaturas.
     """
-    src, dst = Path(original_dir).expanduser(), Path(edited_dir).expanduser()
+    src = Path(original_dir).expanduser()
+    dst = _edited_dir(src, edited_dir)
     exts = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
     names = sorted(f.name for f in dst.iterdir() if f.suffix.lower() in exts and (src / f.name).is_file())
     if not names:
@@ -927,18 +971,19 @@ class _ViewerHandler(BaseHTTPRequestHandler):
 
 
 @_tool
-def open_viewer(original_dir: str, edited_dir: str, port: int = 8765, open_browser: bool = True):
+def open_viewer(original_dir: str, edited_dir: str | None = None, port: int = 8765, open_browser: bool = True):
     """Abre un visor web local para comparar originales con editadas (mismo nombre de
     archivo) con deslizador antes/después, zoom, paneo e histograma, y ajustar en vivo el
     perfil de escena, la mejora automática, brillo, contraste, saturación, calidez, gamma y
     nitidez (siempre a partir del original, sin acumular ediciones). "Guardar" aplica
     los ajustes a la foto completa y la escribe en edited_dir (los originales no se tocan);
-    los ajustes quedan en edited_dir/ajustes.json. Devuelve la URL.
+    los ajustes quedan en edited_dir/ajustes.json. edited_dir: por defecto
+    <original_dir>/mejoradas (se crea). Devuelve la URL.
     """
-    src, dst = Path(original_dir).expanduser(), Path(edited_dir).expanduser()
+    src = Path(original_dir).expanduser()
     if not src.is_dir():
         raise FileNotFoundError(f"No existe la carpeta: {src}")
-    dst.mkdir(parents=True, exist_ok=True)
+    dst = _edited_dir(src, edited_dir)
     _viewer.update(src=src, dst=dst)
     if _viewer["httpd"] is None:
         for p in range(port, port + 20):  # otro visor puede estar usando el puerto
@@ -987,22 +1032,23 @@ def save_preset(name: str, strength: float | None = None, brightness: float = 0,
 
 
 @_tool
-def apply_preset(original_dir: str, edited_dir: str, preset: str, files: list[str] | None = None):
+def apply_preset(original_dir: str, preset: str, edited_dir: str | None = None, files: list[str] | None = None):
     """Aplica un ajuste guardado a varias fotos de original_dir y escribe el resultado
-    con el mismo nombre en edited_dir (los originales no se tocan).
+    con el mismo nombre en edited_dir, por defecto <original_dir>/mejoradas (los originales
+    no se tocan).
     files: nombres de archivo; si se omite, se aplica a todas las fotos de la carpeta.
     """
     presets = _presets()
     if preset not in presets:
         raise ValueError(f"No existe el ajuste '{preset}'. Disponibles: {', '.join(presets) or 'ninguno'}")
-    src, dst = Path(original_dir).expanduser(), Path(edited_dir).expanduser()
+    src = Path(original_dir).expanduser()
+    dst = _edited_dir(src, edited_dir)
     exts = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
     available = sorted(f.name for f in src.iterdir() if f.suffix.lower() in exts)
     names = available if files is None else [Path(f).name for f in files]
     missing = [n for n in names if n not in available]
     if missing:
         raise FileNotFoundError(f"No están en {src}: {', '.join(missing)}")
-    dst.mkdir(parents=True, exist_ok=True)
     errors = _apply_many(src, dst, names, _params(presets[preset]))
     msg = f"Ajuste '{preset}' aplicado a {len(names) - len(errors)} de {len(names)} fotos en {dst}."
     return msg + ("\nErrores:\n" + "\n".join(errors) if errors else "")
@@ -1320,6 +1366,9 @@ def ai_retouch(path: str, strength: float = 1.0, output_path: str | None = None)
     profesionales (3D LUT adaptativa, MIT-Adobe FiveK). Rápido y natural.
 
     strength: 0.0 a 1.5 (1.0 = retoque completo del modelo).
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     img = _ai().lut_retouch(_load(path), strength)
     out = _out_path(path, "retouch", output_path)
@@ -1336,6 +1385,9 @@ def ai_restore(path: str, instruction: str, output_path: str | None = None):
     ("Remove the haze"), lluvia ("Remove the rain") o mejora general
     ("Make the colors and contrast look professional"). Un problema por
     llamada; para varios, encadená llamadas (primero luz, después ruido).
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     img, understood = _ai().instructir(_load(path), instruction)
     out = _out_path(path, "restored", output_path)
@@ -1345,7 +1397,11 @@ def ai_restore(path: str, instruction: str, output_path: str | None = None):
 
 @_tool
 def colorize(path: str, output_path: str | None = None):
-    """Colorea una foto en blanco y negro (DDColor), conservando su detalle original."""
+    """Colorea una foto en blanco y negro (DDColor), conservando su detalle original.
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
+    """
     img = _ai().colorize(_load(path))
     out = _out_path(path, "color", output_path)
     _save(img, out)
@@ -1413,6 +1469,9 @@ def enhance_scene(path: str, scene: str = "auto", amount: float = 1.0, output_pa
 
     scene: "auto" (detecta) o uno de list_scenes (nublado, noche, atardecer, …).
     amount: intensidad 0..1.5 (1 = la del perfil).
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     sc = _scenes()
     if not _check_scene(scene):
@@ -1506,6 +1565,9 @@ def best_enhance(path: str, extra_instructions: list[str] | None = None, coloriz
     (por ejemplo "Remove the haze").
     colorize_bw: si la foto es blanco y negro, colorearla y elegir la mejor
     versión coloreada.
+
+    Salida: por defecto <carpeta de la foto>/mejoradas/<nombre>_<sufijo> (la carpeta se
+    crea; el original no se toca). output_path guarda en otro lugar.
     """
     full = _load(path)
     h, w = full.shape[:2]
@@ -1579,13 +1641,6 @@ def _tune_one(path: Path) -> tuple[str, dict, dict]:
     return scene, res, ref
 
 
-def _default_dst(src: Path, edited_dir: str | None) -> Path:
-    dst = Path(edited_dir).expanduser() if edited_dir else src / "mejoradas"
-    if dst.resolve() == src.resolve():
-        raise ValueError("La carpeta de salida no puede ser la de los originales")
-    return dst
-
-
 @_tool
 def auto_tune(path: str, apply: bool = False, edited_dir: str | None = None, save_profile: str | None = None):
     """Analiza una foto y busca sus parámetros óptimos de perfil de escena, con un
@@ -1608,8 +1663,7 @@ def auto_tune(path: str, apply: bool = False, edited_dir: str | None = None, sav
         sc.save_profile(save_profile, f"{save_profile} (auto_tune de {src.name})", scene, **res["params"])
         msg += f"\nGuardado como perfil '{save_profile}'."
     if apply:
-        dst = _default_dst(src.parent, edited_dir)
-        dst.mkdir(parents=True, exist_ok=True)
+        dst = _edited_dir(src.parent, edited_dir)
         _tune_apply(src.parent, dst, src.name, scene, res)
         msg += f"\nVersión mejorada guardada en {dst / src.name} (original intacto)."
     after = sc.enhance(ref.small, scene, res["amount"], ref.scale, res["params"])
@@ -1691,7 +1745,7 @@ def auto_tune_batch(original_dir: str, edited_dir: str | None = None, files: lis
     src = Path(original_dir).expanduser()
     if not src.is_dir():
         raise FileNotFoundError(f"No existe la carpeta: {src}")
-    dst = _default_dst(src, edited_dir)
+    dst = _edited_dir(src, edited_dir)
     available = sorted(f.name for f in src.iterdir() if f.suffix.lower() in _IMG_EXTS)
     names = available if files is None else [Path(f).name for f in files]
     missing = [n for n in names if n not in available]
@@ -1699,8 +1753,6 @@ def auto_tune_batch(original_dir: str, edited_dir: str | None = None, files: lis
         raise FileNotFoundError(f"No están en {src}: {', '.join(missing)}")
     if not names:
         raise ValueError("No hay fotos para procesar")
-    if apply:
-        dst.mkdir(parents=True, exist_ok=True)
     _tune_job.update(running=True, cancel=False, mode=mode, total=len(names), done=0, current="",
                      started=time.time(), dst=str(dst), results=[], errors=[], summary="")
     threading.Thread(target=_run_tune_job, args=(src, dst, names, mode, apply, save_profile), daemon=True).start()
@@ -1749,9 +1801,12 @@ def tune_cancel():
 
 
 if __name__ == "__main__":
-    # python server.py viewer <originales> <editadas> [puerto]: visor sin el MCP
-    if len(sys.argv) >= 4 and sys.argv[1] == "viewer":
-        print(open_viewer(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 8765), flush=True)
+    # python server.py viewer <originales> [editadas] [puerto]: visor sin el MCP
+    # (editadas por defecto <originales>/mejoradas)
+    if len(sys.argv) >= 3 and sys.argv[1] == "viewer":
+        rest = sys.argv[3:]
+        port = int(rest.pop()) if rest and rest[-1].isdigit() else 8765
+        print(open_viewer(sys.argv[2], rest[0] if rest else None, port), flush=True)
         threading.Event().wait()
     else:
         mcp.run()

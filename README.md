@@ -34,7 +34,10 @@ opcional vía OpenVINO/Vulkan), sin enviar fotos a ningún servicio.
 `list_presets`, `apply_preset`.
 
 Cada herramienta devuelve una vista previa para que el agente vea el resultado. Las fotos originales nunca
-se modifican: los resultados se guardan aparte.
+se modifican: todo lo que se genera va, por defecto, a la subcarpeta **`mejoradas/`** de la carpeta de las
+fotos (se crea sola). Las herramientas que procesan carpetas y el visor guardan con el mismo nombre que el
+original; las herramientas de una sola foto agregan un sufijo (`DSC_0056_scene_nublado.jpg`) para no pisar
+otras versiones. Todas aceptan otra carpeta o ruta de salida si se indica.
 
 ## Visor web
 
@@ -47,7 +50,8 @@ se modifican: los resultados se guardan aparte.
 - Siempre parte del original: los ajustes no se acumulan.
 
 ```bash
-.venv/bin/python server.py viewer ~/Fotos/viaje ~/Fotos/viaje/mejoradas
+.venv/bin/python server.py viewer ~/Fotos/viaje            # editadas en ~/Fotos/viaje/mejoradas
+.venv/bin/python server.py viewer ~/Fotos/viaje ~/otra 8770  # otra carpeta de salida y otro puerto
 ```
 
 Abre `http://127.0.0.1:8765/`. También se puede abrir desde el agente con la herramienta `open_viewer`
@@ -56,7 +60,7 @@ Abre `http://127.0.0.1:8765/`. También se puede abrir desde el agente con la he
 Para que siga corriendo aunque cierres la terminal o el agente (hasta reiniciar la PC):
 
 ```bash
-systemd-run --user --unit=visor-fotos "$PWD/.venv/bin/python" "$PWD/server.py" viewer ~/Fotos/viaje ~/Fotos/viaje/mejoradas
+systemd-run --user --unit=visor-fotos "$PWD/.venv/bin/python" "$PWD/server.py" viewer ~/Fotos/viaje
 systemctl --user stop visor-fotos   # para apagarlo
 ```
 

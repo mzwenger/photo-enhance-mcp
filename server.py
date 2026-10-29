@@ -632,7 +632,9 @@ def compare_gallery(original_dir: str, edited_dir: str | None = None, output_dir
 
 # ---------- visor interactivo ----------
 
-_PARAMS = {"strength": (0.6, 0, 2), "brightness": (0, -100, 100), "contrast": (0, -100, 100),
+# valores por defecto = neutros: "Restablecer" deja la foto como la original (la mejora
+# automática clásica en 0.6 ya recortaba un poco por sí sola)
+_PARAMS = {"strength": (0, 0, 2), "brightness": (0, -100, 100), "contrast": (0, -100, 100),
            "saturation": (0, -100, 100), "warmth": (0, -100, 100), "gamma": (1.0, 0.3, 3),
            "sharpness": (0, 0, 100), "scene_amount": (1.0, 0, 1.5)}
 _viewer = {"httpd": None, "src": None, "dst": None, "port": None}

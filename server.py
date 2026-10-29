@@ -724,8 +724,10 @@ def _base(path: Path, max_side: int) -> tuple[np.ndarray, float]:
     return entry
 
 
-SAFE_SIDE = 480
+SAFE_SIDE = 480     # controles que dependen de los píxeles vecinos (nitidez, mejora, perfil)
+SAFE_FULL = 1600    # controles píxel a píxel: muestra de píxeles reales de la vista, sin promediar
 SAFE_STEPS = 13
+_POINTWISE = ("brightness", "contrast", "saturation", "warmth", "gamma")
 _NEUTRAL = {"strength": 0, "brightness": 0, "contrast": 0, "saturation": 0, "warmth": 0, "gamma": 1.0,
             "sharpness": 0, "scene_amount": 0}
 
@@ -745,35 +747,90 @@ def _post(img: np.ndarray, p: dict, scale: float) -> np.ndarray:
                    p["sharpness"], scale)
 
 
+class _Superseded(Exception):
+    pass
+
+
+_safe_gen = {"n": 0}  # cada pedido nuevo deja obsoletos los anteriores (el usuario ya movió otro control)
+
+
 def _safe_ranges(path: Path, p: dict) -> dict:
-    """Para cada control, qué valores no agregan recorte de luces, sombras ni color respecto de
-    tenerlo en neutro (con el resto de los ajustes como están). También informa cuánto recorta
-    ya el conjunto actual respecto de la original. Sobre una versión de 480 px."""
-    img, scale = _base(path, SAFE_SIDE)
+    """Rango sin pérdida de cada control, con el resto de los ajustes como están.
+
+    Para cada valor del control se mira la foto completa resultante:
+      ok    - no recorta luces, sombras ni color más que la foto original;
+      other - recorta más que la original, pero no más que con este control en neutro
+              (la pérdida viene de otros ajustes);
+      bad   - este control agrega recorte.
+    13 valores por control y, donde cambia el estado, el límite exacto por bisección.
+    Brillo, contraste, saturación, calidez y gamma actúan píxel a píxel: se miden sobre una
+    muestra de píxeles de la vista de 1600 px (achicar la imagen promedia las zonas quemadas
+    pequeñas y da límites demasiado optimistas). Nitidez, mejora automática e intensidad del
+    perfil dependen de los vecinos y se miden a 480 px."""
+    _safe_gen["n"] += 1
+    gen = _safe_gen["n"]
     sc = _scenes()
     scene = (_scene_for(path)[0] if p.get("scene") == "auto" else p.get("scene")) or None
-
-    def scened(amount):
-        return sc.enhance(img, scene, amount, scale, p.get("scene_params")) if scene and amount else img
 
     def worse(a, b):  # a recorta más que b
         return a[0] > b[0] + .1 or a[1] > b[1] + .1 or a[2] > b[2] + .2
 
+    # versión chica, para los controles espaciales
+    img, scale = _base(path, SAFE_SIDE)
+    scened = lambda amount: (sc.enhance(img, scene, amount, scale, p.get("scene_params"))
+                             if scene and amount else img)
+    orig = _clip_stats(img)
     stage = scened(p.get("scene_amount", 1.0))  # el perfil se calcula una vez
+    # vista completa, para los controles píxel a píxel: perfil y mejora una vez, después una
+    # muestra (1 de cada 9 píxeles, ~190 mil) en forma de imagen de una fila
+    big, bscale = _base(path, SAFE_FULL)
+    bstage = sc.enhance(big, scene, p.get("scene_amount", 1.0), bscale, p.get("scene_params")) \
+        if scene and p.get("scene_amount", 1.0) else big
+    if p["strength"] > 0:
+        bstage = _enhance(bstage, p["strength"], bscale)
+    sample = bstage[::3, ::3].reshape(1, -1, 3)
+    orig_big = _clip_stats(big[::3, ::3].reshape(1, -1, 3))
     out = {}
     for k, (default, lo, hi) in _PARAMS.items():
         if k == "scene_amount" and not scene:
             continue
-        vals = np.linspace(lo, hi, SAFE_STEPS)
+        ref = orig
         if k == "scene_amount":
             run = lambda v: _post(scened(float(v)), p, scale)
+        elif k in _POINTWISE:
+            ref = orig_big
+            run = lambda v, k=k: _adjust(sample, **{**{x: p[x] for x in _POINTWISE}, k: float(v)})
         else:
             run = lambda v, k=k: _post(stage, {**p, k: float(v)}, scale)
-        ref = _clip_stats(run(_NEUTRAL[k]))
-        out[k] = {"values": [round(float(v), 4) for v in vals],
-                  "safe": [not worse(_clip_stats(run(v)), ref) for v in vals]}
-    o, c = _clip_stats(img), _clip_stats(_post(stage, p, scale))
-    out["_total"] = {"luces": round(c[0] - o[0], 2), "sombras": round(c[1] - o[1], 2), "color": round(c[2] - o[2], 2)}
+        neutral = _clip_stats(run(_NEUTRAL[k]))
+
+        def state(v):
+            if _safe_gen["n"] != gen:
+                raise _Superseded()
+            c = _clip_stats(run(v))
+            return "ok" if not worse(c, ref) else ("other" if not worse(c, neutral) else "bad")
+
+        vals = [float(v) for v in np.linspace(lo, hi, SAFE_STEPS)]
+        states = [state(v) for v in vals]
+        # tramos [desde, hasta, estado] con el borde exacto entre valores de distinto estado
+        segs, a = [], lo
+        for n in range(len(vals) - 1):
+            if states[n] != states[n + 1]:
+                x0, x1 = vals[n], vals[n + 1]
+                for _ in range(4):
+                    mid = (x0 + x1) / 2
+                    if state(mid) == states[n]:
+                        x0 = mid
+                    else:
+                        x1 = mid
+                b = (x0 + x1) / 2
+                segs.append([round(a, 4), round(b, 4), states[n]])
+                a = b
+        segs.append([round(a, 4), hi, states[-1]])
+        out[k] = segs
+    c = _clip_stats(_post(stage, p, scale))
+    out["_total"] = {"luces": round(c[0] - orig[0], 2), "sombras": round(c[1] - orig[1], 2),
+                     "color": round(c[2] - orig[2], 2)}
     return out
 
 
@@ -922,7 +979,10 @@ class _ViewerHandler(BaseHTTPRequestHandler):
                 self._jpeg(_edit(img, _params(q), scale, path))
             elif u.path == "/api/safe":
                 path = _viewer["src"] / self._name(q.get("name", ""))
-                self._json(_safe_ranges(path, _params(q)))
+                try:
+                    self._json(_safe_ranges(path, _params(q)))
+                except _Superseded:
+                    self._json({"stale": True})
             elif u.path == "/api/scene":
                 path = _viewer["src"] / self._name(q.get("name", ""))
                 scene, probs = _scene_for(path)
@@ -1097,6 +1157,8 @@ body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-seri
 .ctl input::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#e8e8e8;border:1px solid #222}
 #safelegend{color:var(--dim);font-size:12px;margin:-4px 0 10px}
 #safelegend i{display:inline-block;width:10px;height:6px;border-radius:2px;margin:0 3px 1px 0}
+#safeupd{color:#ccc;margin-left:6px}
+#ctls.stale input{filter:saturate(.15) brightness(.75)}
 button{background:#333;color:var(--fg);border:1px solid #444;border-radius:5px;padding:6px 10px;cursor:pointer;font:inherit}
 button:hover{background:#3d3d3d}button.pri{background:var(--acc);border-color:var(--acc)}
 .row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
@@ -1133,7 +1195,9 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
  <select id="scene"><option value="">Sin perfil</option><option value="auto">Automático (detectar escena)</option></select>
  <div id="scenemsg"></div>
  <h3>Ajustes</h3>
- <div id="safelegend" title="Cada barra muestra lo que agrega ese control respecto de tenerlo en neutro, con el resto como está"><i style="background:#2f8f55"></i>sin pérdida <i style="background:#9a3b3b;margin-left:8px"></i>recorta luces, sombras o color</div>
+ <div id="safelegend" title="Para cada valor del control, con el resto de los ajustes como están: verde = la foto no recorta luces, sombras ni color más que la original; ámbar = recorta, pero por otros ajustes; rojo = este control agrega recorte">
+  <i style="background:#2f8f55"></i>sin pérdida <i style="background:#a8862a;margin-left:6px"></i>pérdida por otros ajustes
+  <i style="background:#9a3b3b;margin-left:6px"></i>este control recorta <span id="safeupd"></span></div>
  <div id="safewarn" style="color:#e88;font-size:12px;margin:-6px 0 10px"></div>
  <div id="ctls"></div>
  <div class="row"><button class="pri" id="save">Guardar</button><button id="reset">Restablecer</button></div>
@@ -1158,9 +1222,9 @@ const S=$('stage'),C=$('canvas'),B=$('before'),A=$('after');
 CTL.forEach(([k,l,lo,hi,st])=>{const c=document.createElement('div');c.className='ctl';
  c.innerHTML=`<label for="c_${k}">${l}<span id="v_${k}"></span></label><input type="range" id="c_${k}" min="${lo}" max="${hi}" step="${st}">`;
  $('ctls').append(c);const r=c.querySelector('input');
- r.oninput=()=>{p[k]=+r.value;$('v_'+k).textContent=r.value;pickPreset();dirty=true;lastInput=performance.now();schedule()};
+ r.oninput=()=>{p[k]=+r.value;$('v_'+k).textContent=r.value;pickPreset();dirty=true;lastInput=performance.now();safeStale();schedule()};
  r.ondblclick=()=>{p[k]=defs[k];sync();dirty=true;schedule()}});
-function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p[k]});$('scene').value=p.scene||'';
+function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p[k]});$('scene').value=p.scene||'';if(photos.length)safeStale();
  $('c_scene_amount').closest('.ctl').style.opacity=p.scene?1:.4;pickPreset();if(photos.length)showScene()}
 // el menú muestra el ajuste guardado que coincide con los controles, o queda en blanco
 function pickPreset(){const n=Object.keys(presets).find(n=>{const q={...defs,...presets[n]};
@@ -1250,7 +1314,7 @@ function loadAfter(){if(busy){again=true;return}
  const w=live&&performance.now()-lastInput<300?Math.min(res,1600):res;
  const url=live?`/preview?name=${n}&w=${w}&${q()}`:`/img/edited/${n}?w=${w}&v=${ver}`;
  $('rtag').textContent=live?'Vista previa':'Editada';
- if(url==shown)return;busy=true;again=false;spinOn('procesando…');
+ if(url==shown){safeLater();return}busy=true;again=false;spinOn('procesando…');
  const im=new Image();
  im.onload=()=>{if(at==i){A.src=url;shown=url;A.style.visibility='visible';$('err').style.display='none';hist.after=histo(im);drawHist();safeLater()}done()};
  // la imagen no dice por qué falló: se repite el pedido para leer el error, o avisar si el visor está apagado
@@ -1267,16 +1331,20 @@ function spinOff(){spinN=Math.max(0,spinN-1);if(!spinN){$('spin').style.display=
 function placeSpin(){const r=S.getBoundingClientRect(),sx=d*r.width;$('spin').style.left=((sx+r.width)/2)+'px'}
 // rangos sin pérdida: el servidor prueba valores de cada control y la barra se pinta verde/rojo
 let sTimer=0,sKey='';
-function safeLater(){clearTimeout(sTimer);sTimer=setTimeout(loadSafe,700)}
-function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey)return;sKey=key;const at=key;
- fetch('/api/safe?name='+encodeURIComponent(photos[i].name)+'&'+q()).then(r=>r.json()).then(j=>{if(at!=sKey)return;
+const SAFE_COL={ok:'#2f8f55',other:'#a8862a',bad:'#9a3b3b'};
+function safeStale(){$('ctls').classList.add('stale');$('safeupd').textContent='actualizando…'}
+function safeLater(){clearTimeout(sTimer);sTimer=setTimeout(loadSafe,250)}
+function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey){$('ctls').classList.remove('stale');$('safeupd').textContent='';return}
+ sKey=key;const at=key;safeStale();
+ fetch('/api/safe?name='+encodeURIComponent(photos[i].name)+'&'+q()).then(r=>r.json()).then(j=>{if(at!=sKey||j.stale)return;
   const t=j._total||{},extra=[['luces',t.luces],['sombras',t.sombras],['color',t.color]].filter(([,v])=>v>.1);
   $('safewarn').textContent=extra.length?'Con los ajustes actuales ya se recorta más que la original: '+
    extra.map(([n,v])=>`${n} +${v.toFixed(1)}%`).join(', ')+'.':'';
-  CTL.forEach(([k,,lo,hi])=>{const el=$('c_'+k),d=j[k];if(!d){el.style.removeProperty('--safe');return}
-   const pos=v=>(v-lo)/(hi-lo)*100,step=(d.values[1]-d.values[0])/2,st=[];
-   d.values.forEach((v,n)=>{const c=d.safe[n]?'#2f8f55':'#9a3b3b',a=Math.max(0,pos(v-step)),b=Math.min(100,pos(v+step));st.push(`${c} ${a}%`,`${c} ${b}%`)});
-   el.style.setProperty('--safe',`linear-gradient(to right,${st.join(',')})`)})}).catch(()=>{})}
+  CTL.forEach(([k,,lo,hi])=>{const el=$('c_'+k),segs=j[k];if(!segs){el.style.removeProperty('--safe');return}
+   const pos=v=>Math.max(0,Math.min(100,(v-lo)/(hi-lo)*100)),st=[];
+   segs.forEach(([a,b,s])=>st.push(`${SAFE_COL[s]} ${pos(a)}%`,`${SAFE_COL[s]} ${pos(b)}%`));
+   el.style.setProperty('--safe',`linear-gradient(to right,${st.join(',')})`)});
+  $('ctls').classList.remove('stale');$('safeupd').textContent=''}).catch(()=>{})}
 function err(t){const e=$('err');e.textContent=t;e.style.display='block'}
 function down(){err('No hay conexión con el visor. Volvé a abrirlo (open_viewer o "python server.py viewer …").')}
 B.onerror=()=>down();

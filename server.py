@@ -1528,16 +1528,18 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
   <div id="aireport" hidden></div>
   <h4>Perfil de escena</h4>
   <select id="scene"><option value="">Sin perfil</option><option value="auto">Automático (detectar escena)</option></select>
+  <div id="ctls_scene" class="ctlgrp"></div>
   <div id="scenemsg"></div>
   <div id="ctls_auto" class="ctlgrp"></div>
  </div>
- <div class="tabpane" id="pane_man" hidden><div id="ctls" class="ctlgrp"></div></div>
- <div class="row"><button class="pri" id="save">Guardar</button><button id="reset">Restablecer</button></div>
- <div class="row"><button id="copy">Copiar ajustes</button><button id="paste">Pegar</button></div>
+ <div class="tabpane" id="pane_man" hidden><div id="ctls" class="ctlgrp"></div>
+  <div class="row"><button id="copy">Copiar ajustes</button><button id="paste">Pegar</button></div>
+  <h4>Ajustes guardados</h4>
+  <select id="preset"><option value="">— elegí uno para cargarlo —</option></select>
+  <div class="row"><button id="psave">Guardar como…</button><button id="pdel">Borrar</button></div>
+ </div>
+ <div class="row" style="margin-top:12px"><button class="pri" id="save">Guardar</button><button id="reset">Restablecer</button></div>
  <div id="msg"></div>
- <h3 class="sec">Ajustes guardados</h3>
- <select id="preset"><option value="">— elegí uno para cargarlo —</option></select>
- <div class="row"><button id="psave">Guardar como…</button><button id="pdel">Borrar</button></div>
  <h3 class="sec">Aplicar a varias fotos</h3>
  <div class="row"><button class="pri" id="apply">Aplicar a seleccionadas</button><button id="cancel" hidden>Cancelar</button></div>
  <progress id="prog" value="0" max="1" hidden></progress><div id="jobmsg">Marcá fotos en la lista (Mayús+clic marca un rango).</div></div>
@@ -1559,7 +1561,7 @@ const S=$('stage'),C=$('canvas'),B=$('before'),A=$('after');
 
 CTL.forEach(([k,l,lo,hi,st])=>{const c=document.createElement('div');c.className='ctl';
  c.innerHTML=`<label for="c_${k}">${l}<span id="v_${k}"></span></label><div class="trk"><input type="range" id="c_${k}" min="${lo}" max="${hi}" step="${st}"><i class="scan"></i></div>`;
- $(AUTO.includes(k)?'ctls_auto':'ctls').append(c);const r=c.querySelector('input');
+ $(k=='scene_amount'?'ctls_scene':k=='strength'?'ctls_auto':'ctls').append(c);const r=c.querySelector('input');
  r.oninput=()=>{p[k]=+r.value;$('v_'+k).textContent=r.value;pickPreset();tabDots();dirty=true;lastInput=performance.now();safeStale();schedule()};
  r.ondblclick=()=>{p[k]=defs[k];sync();dirty=true;schedule()}});
 function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p[k]});$('scene').value=p.scene||'';if(photos.length)safeStale();tabDots();

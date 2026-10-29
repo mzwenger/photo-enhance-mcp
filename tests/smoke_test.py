@@ -161,6 +161,19 @@ def viewer_tests(fotos: Path):
         saved = cv2.imdecode(np.fromfile(str(fotos / "mejoradas" / "fútbol.jpg"), np.uint8), cv2.IMREAD_COLOR)
         # vuelve cerca del tamaño original (al menos 90% del lado largo) sin pasarse
         check(.9 * 548 <= saved.shape[1] <= 548, f"visor: recorte reescalado cerca del tamaño original ({saved.shape[1]}x{saved.shape[0]})")
+        # lote con IA: cada foto se analiza por separado y la que tenía recorte lo conserva
+        req = urllib.request.Request(base + "/api/apply", method="POST", data=json.dumps(
+            {"names": ["fútbol.jpg", "chica.jpg"], "params": {}, "mode": "ai"}).encode())
+        urllib.request.urlopen(req, timeout=30).read()
+        for _ in range(600):
+            job = json.loads(get(base + "/api/job")[1])
+            if not job["running"]:
+                break
+            time.sleep(1)
+        aj = json.loads((fotos / "mejoradas" / "ajustes.json").read_text(encoding="utf-8"))
+        again = cv2.imdecode(np.fromfile(str(fotos / "mejoradas" / "fútbol.jpg"), np.uint8), cv2.IMREAD_COLOR)
+        check(job["saved"] == 2 and not job["errors"] and aj["fútbol.jpg"].get("crop") and again.shape == saved.shape,
+              f"visor: lote con IA por foto ({job['saved']} de {job['total']}, errores {job['errors']}, recorte conservado)")
     finally:
         proc.terminate()
         try:

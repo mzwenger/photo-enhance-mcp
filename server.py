@@ -1154,17 +1154,48 @@ def _apply_many(src: Path, dst: Path, names: list[str], p: dict, job: dict | Non
     return errors
 
 
-def _start_job(names: list[str], p: dict) -> None:
+def _ai_apply_one(src: Path, dst: Path, name: str) -> None:
+    """Análisis con IA (auto_tune) de una foto y guardado del resultado, respetando su recorte."""
+    import autotune
+    f = dst / "ajustes.json"
+    g = _geom_params((json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}).get(name, {}))
+    img = _load(str(src / name))
+    if _has_geom(g):
+        img = _geom(img, g)
+    scene = _scene_for(src / name)[0]
+    res = autotune.tune([autotune.Reference(img)], scene)
+    if res["amount"] or _has_geom(g):
+        _apply_one(src, dst, name, _tune_params(scene, res))  # conserva la geometría guardada
+    else:
+        _tune_apply(src, dst, name, scene, res)
+
+
+def _start_job(names: list[str], p: dict, ai: bool = False) -> None:
+    """ai: en vez de copiar p, analiza cada foto por separado y guarda su propio óptimo."""
     if _job["running"]:
         raise RuntimeError("Ya se está aplicando un ajuste a varias fotos")
-    _job.update(running=True, total=len(names), done=0, saved=0, errors=[], cancel=False, names=names)
+    _job.update(running=True, total=len(names), done=0, saved=0, errors=[], cancel=False, names=names,
+                ai=ai, current="")
     src, dst = _viewer["src"], _viewer["dst"]
 
     def run():
         try:
-            _apply_many(src, dst, names, p, _job)
+            if not ai:
+                return _apply_many(src, dst, names, p, _job)
+            for n in names:
+                if _job["cancel"]:
+                    break
+                _job["current"] = n
+                try:
+                    _ai_apply_one(src, dst, n)
+                    _job["saved"] += 1
+                except Exception as e:
+                    _job["errors"] = _job["errors"] + [f"{n}: {e}"]
+                _job["done"] += 1
+                _trim_memory()
         finally:
             _job["running"] = False
+            _job["current"] = ""
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -1273,7 +1304,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
                 names = [self._name(n) for n in body.get("names", [])]
                 if not names:
                     return self._json({"error": "No hay fotos seleccionadas"}, 400)
-                _start_job(names, _params(body.get("params", {})))
+                _start_job(names, _params(body.get("params", {})), ai=body.get("mode") == "ai")
                 self._json({"ok": True, "total": len(names)})
             elif path == "/api/analyze":
                 name = self._name(body.get("name", ""))
@@ -1530,7 +1561,9 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
   <select id="scene"><option value="">Sin perfil</option><option value="auto">Automático (detectar escena)</option></select>
   <div id="ctls_scene" class="ctlgrp"></div>
   <div id="scenemsg"></div>
-  <div id="ctls_auto" class="ctlgrp"></div>
+  <div id="legacy" hidden style="font-size:12px;color:var(--dim);margin-top:8px">Esta foto se guardó con la
+   mejora automática clásica (<span id="legacyv"></span>), que ya no está en el visor porque el perfil hace lo mismo con
+   mejores métodos y sumarlas recorta luces, sombras y color. <button id="legacyoff">Quitarla</button></div>
  </div>
  <div class="tabpane" id="pane_man" hidden><div id="ctls" class="ctlgrp"></div>
   <div class="row"><button id="copy">Copiar ajustes</button><button id="paste">Pegar</button></div>
@@ -1550,10 +1583,10 @@ const $=id=>document.getElementById(id);
 const VER='__VERSION__',CID=Math.random().toString(36).slice(2,10),_fetch=window.fetch.bind(window);
 window.fetch=(...a)=>_fetch(...a).then(r=>{const v=r.headers.get('X-Viewer');if(v&&v!=VER)$('outdated').style.display='flex';return r});
 setInterval(()=>fetch('/api/presets').catch(()=>{}),30000);  // detectar la actualización aunque no se toque nada
-const CTL=[["strength","Mejora automática clásica",0,2,.05],["brightness","Brillo",-100,100,1],["contrast","Contraste",-100,100,1],
+const CTL=[["brightness","Brillo",-100,100,1],["contrast","Contraste",-100,100,1],
  ["saturation","Saturación",-100,100,1],["warmth","Calidez",-100,100,1],["gamma","Gamma (sombras)",.3,3,.05],["sharpness","Nitidez",0,100,1],
  ["scene_amount","Intensidad del perfil",0,1.5,.05]];
-const AUTO=['scene_amount','strength'];  // pestaña Automática / IA; el resto, Manual
+const AUTO=['scene_amount'];  // pestaña Automática / IA; el resto, Manual
 let photos=[],defs={},i=0,p={},dirty=false,clip=null,ver=0,presets={},sel=new Set(),lastCheck=-1;
 let z=1,tx=0,ty=0,d=.5,fw=1,fh=1,ar=1.5,res=0,fullW=6000,mode=null,last=null,pTimer=0,rTimer=0;
 let busy=false,again=false,shown='',hiTimer=0,lastInput=0;
@@ -1561,10 +1594,11 @@ const S=$('stage'),C=$('canvas'),B=$('before'),A=$('after');
 
 CTL.forEach(([k,l,lo,hi,st])=>{const c=document.createElement('div');c.className='ctl';
  c.innerHTML=`<label for="c_${k}">${l}<span id="v_${k}"></span></label><div class="trk"><input type="range" id="c_${k}" min="${lo}" max="${hi}" step="${st}"><i class="scan"></i></div>`;
- $(k=='scene_amount'?'ctls_scene':k=='strength'?'ctls_auto':'ctls').append(c);const r=c.querySelector('input');
+ $(AUTO.includes(k)?'ctls_scene':'ctls').append(c);const r=c.querySelector('input');
  r.oninput=()=>{p[k]=+r.value;$('v_'+k).textContent=r.value;pickPreset();tabDots();dirty=true;lastInput=performance.now();safeStale();schedule()};
  r.ondblclick=()=>{p[k]=defs[k];sync();dirty=true;schedule()}});
-function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p[k]});$('scene').value=p.scene||'';if(photos.length)safeStale();tabDots();
+function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p[k]});
+ $('legacy').hidden=!(p.strength>0);$('legacyv').textContent=p.strength;applyLabel();$('scene').value=p.scene||'';if(photos.length)safeStale();tabDots();
  $('c_scene_amount').closest('.ctl').style.opacity=p.scene?1:.4;pickPreset();if(photos.length)showScene()}
 // el menú muestra el ajuste guardado que coincide con los controles, o queda en blanco
 function pickPreset(){const n=Object.keys(presets).find(n=>{const q={...defs,...presets[n]};
@@ -1582,9 +1616,10 @@ function showScene(){const m=$('scenemsg'),at=i;
   const pr=Object.entries(j.probs||{}).slice(0,3).map(([k,v])=>`${sceneLabels[k]||k} ${Math.round(v*100)}%`).join(' · ');
   m.textContent=`Detectada: ${j.label}. ${pr}`}).catch(()=>m.textContent='No se pudo detectar la escena.')}
 $('scene').onchange=()=>{p.scene=$('scene').value;delete p.scene_params;
- if(p.scene&&p.strength>0){p.strength=0;msg('Mejora automática clásica puesta en 0: el perfil ya incluye esa mejora.')}
+ if(p.scene)p.strength=0;  // la mejora clásica no se suma a un perfil
  sync();dirty=true;schedule()};
 const msg=t=>$('msg').textContent=t;
+$('legacyoff').onclick=()=>{p.strength=0;sync();dirty=true;schedule()};
 
 fetch('/api/list').then(r=>r.json()).then(j=>{photos=j.photos;defs=j.defaults;sceneLabels=j.scenes||{};
  for(const [k,l] of Object.entries(sceneLabels))$('scene').add(new Option(l,k));
@@ -1597,7 +1632,14 @@ fetch('/api/list').then(r=>r.json()).then(j=>{photos=j.photos;defs=j.defaults;sc
  marks();show(0)}).catch(down);
 function marks(){[...$('items').children].forEach((e,j)=>{e.classList.toggle('on',j==i);e.classList.toggle('saved',!!photos[j].params);
  e.firstChild.checked=sel.has(j)});$('selcount').textContent=`${sel.size} de ${photos.length} seleccionadas`;
- $('apply').textContent=sel.size?`Aplicar a ${sel.size} seleccionada${sel.size>1?'s':''}`:'Aplicar a seleccionadas'}
+ applyLabel()}
+// si los ajustes vienen del análisis con IA, el lote analiza cada foto: copiar el óptimo de una a otras no tiene sentido
+const aiMode=()=>!!p.scene_params;
+function applyLabel(){const n=sel.size,s=n>1?'s':'';
+ $('apply').textContent=aiMode()?(n?`Analizar y mejorar con IA ${n} seleccionada${s}`:'Analizar y mejorar con IA las seleccionadas')
+  :(n?`Aplicar a ${n} seleccionada${s}`:'Aplicar a seleccionadas');
+ $('apply').title=aiMode()?'Cada foto se analiza por separado y recibe su propio ajuste óptimo (~20-60 s por foto). Para copiar estos valores exactos usá Copiar / Pegar.'
+  :'Aplica los ajustes actuales a las fotos marcadas.'}
 $('selall').onclick=()=>{photos.forEach((_,j)=>sel.add(j));marks()};
 $('selnone').onclick=()=>{sel.clear();marks()};
 $('selinv').onclick=()=>{photos.forEach((_,j)=>sel.has(j)?sel.delete(j):sel.add(j));marks()};
@@ -1615,14 +1657,15 @@ $('pdel').onclick=async()=>{const n=$('preset').value;if(!n)return msg('Elegí p
  try{await post('/api/presets',{name:n,delete:true});await loadPresets();msg(`Ajuste "${n}" borrado.`)}catch(x){msg('Error: '+x.message)}};
 
 $('apply').onclick=async()=>{if(!sel.size)return $('jobmsg').textContent='Primero marcá fotos en la lista.';
- const names=[...sel].sort((a,b)=>a-b).map(j=>photos[j].name),src=$('preset').value;
- if(!confirm(`¿Aplicar ${src?`"${src}"`:'los ajustes actuales'} a ${names.length} foto${names.length>1?'s':''}? `+
+ const names=[...sel].sort((a,b)=>a-b).map(j=>photos[j].name),src=$('preset').value,ai=aiMode(),s=names.length>1?'s':'';
+ if(!confirm((ai?`¿Analizar con IA ${names.length} foto${s} y guardar el ajuste óptimo de cada una? Puede tardar ~${Math.max(1,Math.round(names.length*.6))} min. `
+  :`¿Aplicar ${src?`"${src}"`:'los ajustes actuales'} a ${names.length} foto${s}? `)+
   'Se reemplazan sus versiones editadas (los originales no se tocan).'))return;
- try{await post('/api/apply',{names,params:p});watchJob()}catch(x){$('jobmsg').textContent='Error: '+x.message}};
+ try{await post('/api/apply',{names,params:p,mode:ai?'ai':''});watchJob()}catch(x){$('jobmsg').textContent='Error: '+x.message}};
 $('cancel').onclick=()=>post('/api/cancel',{}).catch(()=>{});
 async function watchJob(){$('apply').disabled=true;$('cancel').hidden=false;$('prog').hidden=false;
  for(;;){let j;try{j=await (await fetch('/api/job')).json()}catch(x){down();break}
-  $('prog').max=j.total||1;$('prog').value=j.done;$('jobmsg').textContent=`Procesando ${j.done} de ${j.total}…`;
+  $('prog').max=j.total||1;$('prog').value=j.done;$('jobmsg').textContent=j.ai&&j.current?`Analizando con IA ${j.current} (${j.done+1} de ${j.total})…`:`Procesando ${j.done} de ${j.total}…`;
   if(!j.running){
    $('jobmsg').textContent=(j.cancelled?`Cancelado: se guardaron ${j.saved} de ${j.total}.`:`Listo: ${j.saved} de ${j.total} fotos guardadas.`)+
     (j.errors.length?` ${j.errors.length} con error: `+j.errors.join('; '):'');await refresh(j.names);break}

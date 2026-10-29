@@ -132,6 +132,18 @@ def viewer_tests(fotos: Path):
         check("brightness" in safe and "_total" in safe, "visor: rangos sin pérdida")
         sc = json.loads(get(base + f"/api/scene?{q}")[1])
         check("scene" in sc, f"visor: escena detectada ({sc.get('scene')})")
+        # análisis y mejora con IA desde el visor (en segundo plano, con progreso)
+        req = urllib.request.Request(base + "/api/analyze", method="POST",
+                                     data=json.dumps({"name": "chica.jpg", "params": {}}).encode())
+        urllib.request.urlopen(req, timeout=30).read()
+        for _ in range(600):
+            an = json.loads(get(base + "/api/analyze")[1])
+            if not an["running"]:
+                break
+            time.sleep(1)
+        r = an.get("result") or {}
+        check(not an.get("error") and r.get("diagnosis") and "amount" in r,
+              f"visor: análisis con IA ({r.get('scene')}, calidad {r.get('quality_before')} -> {r.get('quality_after')})")
         g = "&rot90=90&rotate=3&crop=0.25,0.25,0.5,0.5"
         info = json.loads(get(base + f"/api/info?{q}{g}")[1])
         check(info["upscale"] == 2 and info["final_width"] <= info["orig_width"],

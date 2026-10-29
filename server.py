@@ -1000,6 +1000,67 @@ def _safe_ranges(path: Path, p: dict, cid: str = "") -> dict:
     return out
 
 
+# ---------- análisis con IA desde el visor ----------
+
+_analysis = {"running": False, "name": None, "progress": 0, "result": None, "error": None}
+
+
+def _diagnose(img: np.ndarray, path: Path) -> list[str]:
+    """Diagnóstico legible de la foto: escena, exposición, recortes, ruido, tinte, contraste y color."""
+    import clipping
+    sc = _scenes()
+    k = min(1.0, 1200 / max(img.shape[:2]))
+    small = cv2.resize(img, (round(img.shape[1] * k), round(img.shape[0] * k)), interpolation=cv2.INTER_AREA) if k < 1 else img
+    st = sc.analyze(img)
+    scene, probs = _scene_for(path)
+    out = [f"Escena: {sc.PROFILES[scene]['label']} ({probs.get(scene, 0) * 100:.0f}% de confianza)"]
+    med = st["median"]
+    out.append("Exposición: " + ("subexpuesta (oscura)" if med < .3 else "sobreexpuesta (clara)" if med > .7
+                                  else "correcta") + f", tono medio {med * 100:.0f}%")
+    m = clipping.masks(small)
+    hi, lo = m["luces"].mean() * 100, m["sombras"].mean() * 100
+    out.append(f"Recorte en la original: luces {hi:.1f}%, sombras {lo:.1f}%"
+               + (" (zonas claras quemadas)" if hi > 1 else ""))
+    nz = st["noise"] * 255
+    out.append("Ruido: " + ("bajo" if nz < 1.5 else "medio" if nz < 3 else "alto") + f" ({nz:.1f} niveles)"
+               + (", con ruido de color" if st["chroma_noise"] > .8 else ""))
+    lab = cv2.cvtColor(small.astype(np.float32) / 255, cv2.COLOR_BGR2LAB)
+    da, db = sc._neutral_shift(np.dstack([lab[..., 0] * 2.55, lab[..., 1] + 128, lab[..., 2] + 128]))
+    tint = [n for v, n in ((db, "cálido/amarillo"), (-db, "frío/azul"), (da, "magenta"), (-da, "verde")) if v > 3]
+    out.append("Color de la luz: " + (f"tinte {tint[0]}" if tint else "neutro"))
+    sd = float(lab[..., 0].std()) / 100
+    out.append("Contraste: " + ("bajo (imagen plana)" if sd < .15 else "alto" if sd > .3 else "normal"))
+    sat = float(cv2.cvtColor(small, cv2.COLOR_BGR2HSV)[..., 1].mean())
+    out.append("Colores: " + ("apagados" if sat < 50 else "muy saturados" if sat > 140 else "normales"))
+    return out
+
+
+def _run_analysis(path: Path, g: dict) -> None:
+    import autotune
+    a = _analysis
+    try:
+        img = _load(str(path))
+        if _has_geom(g):
+            img = _geom(img, g)
+        scene = _scene_for(path)[0]
+        diag = _diagnose(img, path)
+        ref = autotune.Reference(img)
+        res = autotune.tune([ref], scene, progress=lambda n: a.update(progress=n))
+        sc = _scenes()
+        base = sc.PROFILES[scene]
+        a["result"] = {"name": path.name, "scene": scene, "label": base["label"], "params": res["params"],
+                       "amount": res["amount"], "quality_before": round(res["quality_before"], 1),
+                       "quality_after": round(res["quality_after"], 1), "diagnosis": diag,
+                       "changes": {k: [round(float(base[k]), 3), round(v, 3)] for k, v in res["params"].items()
+                                   if abs(v - float(base[k])) > 1e-6},
+                       "report": autotune.report(res, base)}
+    except Exception as e:
+        a["error"] = str(e)
+    finally:
+        a["running"] = False
+        _trim_memory()
+
+
 def _viewer_names() -> list[str]:
     src, dst = _viewer["src"], _viewer["dst"]
     exts = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
@@ -1183,6 +1244,8 @@ class _ViewerHandler(BaseHTTPRequestHandler):
                 path = _viewer["src"] / self._name(q.get("name", ""))
                 scene, probs = _scene_for(path)
                 self._json({"scene": scene, "label": _scenes().PROFILES[scene]["label"], "probs": probs})
+            elif u.path == "/api/analyze":
+                self._json({k: v for k, v in _analysis.items()})
             elif u.path == "/api/presets":
                 self._json(_presets())
             elif u.path == "/api/job":
@@ -1212,6 +1275,14 @@ class _ViewerHandler(BaseHTTPRequestHandler):
                     return self._json({"error": "No hay fotos seleccionadas"}, 400)
                 _start_job(names, _params(body.get("params", {})))
                 self._json({"ok": True, "total": len(names)})
+            elif path == "/api/analyze":
+                name = self._name(body.get("name", ""))
+                if _analysis["running"]:
+                    raise RuntimeError("Ya hay un análisis en curso")
+                _analysis.update(running=True, name=name, progress=0, result=None, error=None)
+                threading.Thread(target=_run_analysis, daemon=True,
+                                 args=(_viewer["src"] / name, _geom_params(body.get("params", {})))).start()
+                self._json({"ok": True})
             elif path == "/api/cancel":
                 _job["cancel"] = True
                 self._json({"ok": True})
@@ -1355,13 +1426,23 @@ body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-seri
 #safelegend{color:var(--dim);font-size:12px;margin:-4px 0 10px}
 #safelegend i{display:inline-block;width:10px;height:6px;border-radius:2px;margin:0 3px 1px 0}
 #safeupd{color:#ccc;margin-left:6px}
-#ctls.stale input{filter:saturate(.15) brightness(.75)}
+.ctlgrp.stale input{filter:saturate(.15) brightness(.75)}
+/* pestañas Automática / IA y Manual */
+.tabs{display:flex;gap:2px;margin:16px 0 10px;border-bottom:1px solid var(--line)}
+.tabs button{flex:1;border:0;border-radius:6px 6px 0 0;background:transparent;padding:8px 4px;color:var(--dim);position:relative}
+.tabs button.on{background:#2a2a2a;color:var(--fg);box-shadow:inset 0 -2px var(--acc)}
+.tabs .dot{display:none;width:7px;height:7px;border-radius:50%;background:var(--acc);margin-left:6px;vertical-align:1px}
+.tabs .dot.on{display:inline-block}
+#side h4{margin:12px 0 6px;font-size:12px;color:var(--dim);font-weight:600}
+button.wide{width:100%;padding:9px;margin-bottom:8px}
+#aireport{background:#1d2430;border:1px solid #2c3850;border-radius:6px;padding:8px 10px;margin-bottom:6px;font-size:12px;line-height:1.5}
+#aireport ul{margin:4px 0 6px;padding-left:16px}#aireport b{color:#cfe0ff;font-weight:600}
 /* recálculo de rangos: un brillo recorre cada barra */
 .trk{position:relative}
 .scan{position:absolute;left:0;right:0;top:5px;height:6px;border-radius:3px;pointer-events:none;display:none;
  background:linear-gradient(90deg,transparent,#ffffffb0,transparent) no-repeat;background-size:30% 100%;
  animation:scan 1.1s ease-in-out infinite}
-#ctls.stale .scan{display:block}
+.ctlgrp.stale .scan{display:block}
 @keyframes scan{from{background-position:-35% 0}to{background-position:135% 0}}
 /* modo recorte */
 #cropui{position:absolute;inset:0;display:none;background:#111;touch-action:none}
@@ -1436,16 +1517,21 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
   <div id="cropsize"></div>
   <div class="row"><button class="pri" id="cropok">Aplicar</button><button id="cropcancel">Cancelar</button></div>
  </div>
- <h3>Perfil de escena</h3>
- <select id="scene"><option value="">Sin perfil</option><option value="auto">Automático (detectar escena)</option></select>
- <div id="scenemsg"></div>
- <h3>Ajustes</h3>
+ <div class="tabs"><button id="tab_auto" class="on">Automática / IA<span class="dot" id="dot_auto"></span></button><button id="tab_man">Manual<span class="dot" id="dot_man"></span></button></div>
  <div id="safelegend" title="Para cada valor del control, con el resto de los ajustes como están. Verde: no recorta luces, sombras ni color más que la original. Amarillo: recorta más, pero en manchas chicas y dispersas (reflejos, brillos) que no se notan. Rojo: recorte visible (zonas continuas, como un cielo quemado) causado por este control. Gris: recorte visible que viene de otros ajustes.">
   <i style="background:#2f8f55"></i>sin recorte <i style="background:#c8a92e;margin-left:6px"></i>tolerable
   <i style="background:#9a3b3b;margin-left:6px"></i>visible <i style="background:#5f6b7a;margin-left:6px"></i>visible por otros ajustes
   <span id="safeupd"></span></div>
  <div id="safewarn" style="color:#e88;font-size:12px;margin:-6px 0 10px"></div>
- <div id="ctls"></div>
+ <div class="tabpane" id="pane_auto">
+  <button class="pri wide" id="aibtn" title="Analiza la foto (escena, exposición, recortes, ruido, color) y busca los parámetros óptimos del perfil con el mismo procedimiento que auto_tune. No guarda: revisás y tocás Guardar.">Analizar y mejorar con IA</button>
+  <div id="aireport" hidden></div>
+  <h4>Perfil de escena</h4>
+  <select id="scene"><option value="">Sin perfil</option><option value="auto">Automático (detectar escena)</option></select>
+  <div id="scenemsg"></div>
+  <div id="ctls_auto" class="ctlgrp"></div>
+ </div>
+ <div class="tabpane" id="pane_man" hidden><div id="ctls" class="ctlgrp"></div></div>
  <div class="row"><button class="pri" id="save">Guardar</button><button id="reset">Restablecer</button></div>
  <div class="row"><button id="copy">Copiar ajustes</button><button id="paste">Pegar</button></div>
  <div id="msg"></div>
@@ -1462,9 +1548,10 @@ const $=id=>document.getElementById(id);
 const VER='__VERSION__',CID=Math.random().toString(36).slice(2,10),_fetch=window.fetch.bind(window);
 window.fetch=(...a)=>_fetch(...a).then(r=>{const v=r.headers.get('X-Viewer');if(v&&v!=VER)$('outdated').style.display='flex';return r});
 setInterval(()=>fetch('/api/presets').catch(()=>{}),30000);  // detectar la actualización aunque no se toque nada
-const CTL=[["strength","Mejora automática",0,2,.05],["brightness","Brillo",-100,100,1],["contrast","Contraste",-100,100,1],
+const CTL=[["strength","Mejora automática clásica",0,2,.05],["brightness","Brillo",-100,100,1],["contrast","Contraste",-100,100,1],
  ["saturation","Saturación",-100,100,1],["warmth","Calidez",-100,100,1],["gamma","Gamma (sombras)",.3,3,.05],["sharpness","Nitidez",0,100,1],
  ["scene_amount","Intensidad del perfil",0,1.5,.05]];
+const AUTO=['scene_amount','strength'];  // pestaña Automática / IA; el resto, Manual
 let photos=[],defs={},i=0,p={},dirty=false,clip=null,ver=0,presets={},sel=new Set(),lastCheck=-1;
 let z=1,tx=0,ty=0,d=.5,fw=1,fh=1,ar=1.5,res=0,fullW=6000,mode=null,last=null,pTimer=0,rTimer=0;
 let busy=false,again=false,shown='',hiTimer=0,lastInput=0;
@@ -1472,10 +1559,10 @@ const S=$('stage'),C=$('canvas'),B=$('before'),A=$('after');
 
 CTL.forEach(([k,l,lo,hi,st])=>{const c=document.createElement('div');c.className='ctl';
  c.innerHTML=`<label for="c_${k}">${l}<span id="v_${k}"></span></label><div class="trk"><input type="range" id="c_${k}" min="${lo}" max="${hi}" step="${st}"><i class="scan"></i></div>`;
- $('ctls').append(c);const r=c.querySelector('input');
- r.oninput=()=>{p[k]=+r.value;$('v_'+k).textContent=r.value;pickPreset();dirty=true;lastInput=performance.now();safeStale();schedule()};
+ $(AUTO.includes(k)?'ctls_auto':'ctls').append(c);const r=c.querySelector('input');
+ r.oninput=()=>{p[k]=+r.value;$('v_'+k).textContent=r.value;pickPreset();tabDots();dirty=true;lastInput=performance.now();safeStale();schedule()};
  r.ondblclick=()=>{p[k]=defs[k];sync();dirty=true;schedule()}});
-function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p[k]});$('scene').value=p.scene||'';if(photos.length)safeStale();
+function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p[k]});$('scene').value=p.scene||'';if(photos.length)safeStale();tabDots();
  $('c_scene_amount').closest('.ctl').style.opacity=p.scene?1:.4;pickPreset();if(photos.length)showScene()}
 // el menú muestra el ajuste guardado que coincide con los controles, o queda en blanco
 function pickPreset(){const n=Object.keys(presets).find(n=>{const q={...defs,...presets[n]};
@@ -1547,6 +1634,7 @@ async function refresh(names){const j=await (await fetch('/api/list')).json();
 fetch('/api/job').then(r=>r.json()).then(j=>{if(j.running)watchJob()}).catch(()=>{});
 
 function show(k){if(cropping)cropExit();i=(k+photos.length)%photos.length;const ph=photos[i];
+ if(ph.ai)aiReport(ph.ai);else $('aireport').hidden=true;
  p={...defs,...(ph.params||{})};sync();dirty=false;res=0;z=1;shown='';A.style.visibility='hidden';
  $('name').textContent=`${ph.name} (${i+1}/${photos.length})`;marks();$('items').children[i].scrollIntoView({block:'nearest'});
  msg(ph.params?'Ajustes guardados con este visor.':ph.edited?'Editada: versión guardada en la carpeta (ajustes desconocidos).':'Sin versión editada todavía.');
@@ -1589,9 +1677,10 @@ function placeSpin(){const r=S.getBoundingClientRect(),sx=d*r.width;$('spin').st
 // rangos sin pérdida: el servidor prueba valores de cada control y la barra se pinta verde/rojo
 let sTimer=0,sKey='';
 const SAFE_COL={ok:'#2f8f55',tol:'#c8a92e',bad:'#9a3b3b',other:'#5f6b7a'};
-function safeStale(){$('ctls').classList.add('stale');$('safeupd').textContent='actualizando…'}
+const grps=()=>document.querySelectorAll('.ctlgrp');
+function safeStale(){grps().forEach(e=>e.classList.add('stale'));$('safeupd').textContent='actualizando…'}
 function safeLater(){clearTimeout(sTimer);sTimer=setTimeout(loadSafe,250)}
-function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey){$('ctls').classList.remove('stale');$('safeupd').textContent='';return}
+function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey){grps().forEach(e=>e.classList.remove('stale'));$('safeupd').textContent='';return}
  sKey=key;const at=key;safeStale();
  fetch('/api/safe?name='+encodeURIComponent(photos[i].name)+'&cid='+CID+'&'+q()).then(r=>r.json()).then(j=>{if(at!=sKey||j.stale)return;
   const t=j._total||{},w=$('safewarn'),
@@ -1604,7 +1693,7 @@ function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey){$('ctls').cla
    // estado desconocido -> gris: un color inválido haría que el navegador no dibuje la barra
    segs.forEach(([a,b,s])=>{const c=SAFE_COL[s]||'#555';st.push(`${c} ${pos(a)}%`,`${c} ${pos(b)}%`)});
    el.style.setProperty('--safe',`linear-gradient(to right,${st.join(',')})`)});
-  $('ctls').classList.remove('stale');$('safeupd').textContent=''}).catch(()=>{})}
+  grps().forEach(e=>e.classList.remove('stale'));$('safeupd').textContent=''}).catch(()=>{})}
 function err(t){const e=$('err');e.textContent=t;e.style.display='block'}
 function down(){err('No hay conexión con el visor. Volvé a abrirlo (open_viewer o "python server.py viewer …").')}
 B.onerror=()=>down();
@@ -1757,6 +1846,43 @@ function geomChanged(){dirty=true;res=0;shown='';A.style.visibility='hidden';saf
 $('cropbtn').onclick=cropEnter;$('cropok').onclick=cropApply;$('cropcancel').onclick=cropExit;
 $('cropclear').onclick=()=>{if(!hasGeom(p))return;p.rot90=0;p.rotate=0;p.crop=null;if(cropping)cropExit();geomChanged();msg('Recorte y rotación quitados (guardá para aplicarlo).')};
 addEventListener('resize',()=>{if(cropping)cropLayout()});
+
+// ---------- pestañas Automática / IA y Manual ----------
+function tab(t){for(const x of ['auto','man']){$('tab_'+x).classList.toggle('on',x==t);$('pane_'+x).hidden=x!=t}
+ try{localStorage.setItem('visor_tab',t)}catch(e){}}
+$('tab_auto').onclick=()=>tab('auto');$('tab_man').onclick=()=>tab('man');
+try{const t=localStorage.getItem('visor_tab');if(t)tab(t)}catch(e){}
+// punto en cada pestaña si tiene ajustes activos (los dos modos se combinan: automático y luego manual)
+function tabDots(){if(!defs||defs.brightness===undefined)return;
+ $('dot_auto').classList.toggle('on',!!p.scene||p.strength>0);
+ $('dot_man').classList.toggle('on',CTL.some(([k])=>!AUTO.includes(k)&&+p[k]!=+defs[k]))}
+
+// ---------- análisis y mejora con IA ----------
+let aiTimer=0;
+$('aibtn').onclick=async()=>{const name=photos[i].name;
+ try{await post('/api/analyze',{name,params:geomOf(p)})}catch(x){return msg('Error: '+x.message)}
+ $('aibtn').disabled=true;$('aibtn').textContent='Analizando…';spinOn('analizando con IA…');
+ const poll=async()=>{let j;try{j=await (await fetch('/api/analyze')).json()}catch(x){aiDone();return down()}
+  if(j.running){$('spintxt').textContent=`analizando con IA… ${Math.min(95,Math.round(j.progress/60*100))}%`;aiTimer=setTimeout(poll,800);return}
+  aiDone();if(j.error)return msg('El análisis falló: '+j.error);aiApply(j.result)};
+ poll()};
+function aiDone(){spinOff();$('aibtn').disabled=false;$('aibtn').textContent='Analizar y mejorar con IA'}
+const PNAME={wb:'balance de blancos',warmth:'calidez',exposure:'exposición',target:'tono medio',shadows:'sombras',highlights:'luces',
+ clarity:'claridad',contrast:'contraste',dehaze:'neblina',vibrance:'vibración',denoise:'reducción de ruido',sharpen:'nitidez'};
+function aiApply(r){const ph=photos.findIndex(x=>x.name==r.name);
+ if(r.name!=photos[i].name){msg(`Terminó el análisis de ${r.name}; abrila para ver el resultado.`);if(ph>=0)photos[ph].ai=r;return}
+ // la IA decide la parte automática; los ajustes manuales vuelven a neutro para partir de ahí
+ p={...defs,...geomOf(p),strength:0};
+ if(r.amount){p.scene=r.scene;p.scene_params=r.params;p.scene_amount=r.amount}else{p.scene='';delete p.scene_params}
+ photos[i].ai=r;sync();dirty=true;schedule();tab('auto');aiReport(r)}
+function aiReport(r){const box=$('aireport'),ch=Object.entries(r.changes||{});
+ box.innerHTML=`<b>Análisis</b><ul>${r.diagnosis.map(d=>`<li>${d}</li>`).join('')}</ul>`+
+  (r.amount?`<b>Mejora</b>: perfil ${r.label}`+(r.amount<1?` al ${Math.round(r.amount*100)}%`:'')+
+   `, calidad estimada ${r.quality_before} → ${r.quality_after}.`+
+   (ch.length?`<ul>${ch.map(([k,[a,b]])=>`<li>${PNAME[k]||k}: ${a} → ${b}</li>`).join('')}</ul>`:' Sin cambios respecto del perfil.')
+   :`<b>Resultado</b>: ningún ajuste mejora la foto (calidad estimada ${r.quality_before}); se deja como está.`)+
+  `<div style="color:var(--dim);margin-top:4px">Los ajustes manuales quedaron en neutro. Revisá y tocá <b>Guardar</b>.</div>`;
+ box.hidden=false}
 </script></body></html>"""
 
 

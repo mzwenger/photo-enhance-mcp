@@ -753,10 +753,12 @@ class _Superseded(Exception):
     pass
 
 
-_safe_gen = {"n": 0}  # cada pedido nuevo deja obsoletos los anteriores (el usuario ya movió otro control)
+# por pestaña: cada pedido nuevo deja obsoletos los anteriores de la misma pestaña (el usuario
+# ya movió otro control), sin cancelar los cálculos de otra pestaña abierta
+_safe_gen: dict = {}
 
 
-def _safe_ranges(path: Path, p: dict) -> dict:
+def _safe_ranges(path: Path, p: dict, cid: str = "") -> dict:
     """Rango sin pérdida de cada control, con el resto de los ajustes como están.
 
     Para cada valor del control se mira la foto completa resultante (ver clipping.py):
@@ -769,8 +771,9 @@ def _safe_ranges(path: Path, p: dict) -> dict:
     muestra de píxeles de la vista de 1600 px (achicar la imagen promedia las zonas quemadas
     pequeñas y da límites demasiado optimistas). Nitidez, mejora automática e intensidad del
     perfil dependen de los vecinos y se miden a 480 px."""
-    _safe_gen["n"] += 1
-    gen = _safe_gen["n"]
+    gen = _safe_gen[cid] = _safe_gen.get(cid, 0) + 1
+    while len(_safe_gen) > 50:
+        _safe_gen.pop(next(iter(_safe_gen)))
     sc = _scenes()
     scene = (_scene_for(path)[0] if p.get("scene") == "auto" else p.get("scene")) or None
 
@@ -811,7 +814,7 @@ def _safe_ranges(path: Path, p: dict) -> dict:
         neutral, neutral_vis = _clip_stats(nimg), clipping.assess(nimg, om)["level"] == "vis"
 
         def state(v, om=om, run=run, neutral=neutral, neutral_vis=neutral_vis):
-            if _safe_gen["n"] != gen:
+            if _safe_gen.get(cid) != gen:
                 raise _Superseded()
             r = run(v)
             lvl = clipping.assess(r, om)["level"]
@@ -946,6 +949,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Viewer", VIEWER_VERSION)
         self.end_headers()
         self.wfile.write(body)
 
@@ -966,7 +970,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
             if u.path == "/":
-                self._send(_VIEWER.encode(), "text/html; charset=utf-8")
+                self._send(_VIEWER.replace("__VERSION__", VIEWER_VERSION).encode(), "text/html; charset=utf-8")
             elif u.path == "/api/info":
                 self._json({"width": _full_width(_viewer["src"] / self._name(q.get("name", "")))})
             elif u.path == "/api/list":
@@ -990,7 +994,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             elif u.path == "/api/safe":
                 path = _viewer["src"] / self._name(q.get("name", ""))
                 try:
-                    self._json(_safe_ranges(path, _params(q)))
+                    self._json(_safe_ranges(path, _params(q), q.get("cid", "")[:32]))
                 except _Superseded:
                     self._json({"stale": True})
             elif u.path == "/api/scene":
@@ -1169,6 +1173,15 @@ body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-seri
 #safelegend i{display:inline-block;width:10px;height:6px;border-radius:2px;margin:0 3px 1px 0}
 #safeupd{color:#ccc;margin-left:6px}
 #ctls.stale input{filter:saturate(.15) brightness(.75)}
+/* recálculo de rangos: un brillo recorre cada barra */
+.trk{position:relative}
+.scan{position:absolute;left:0;right:0;top:5px;height:6px;border-radius:3px;pointer-events:none;display:none;
+ background:linear-gradient(90deg,transparent,#ffffffb0,transparent) no-repeat;background-size:30% 100%;
+ animation:scan 1.1s ease-in-out infinite}
+#ctls.stale .scan{display:block}
+@keyframes scan{from{background-position:-35% 0}to{background-position:135% 0}}
+#outdated{position:fixed;top:0;left:0;right:0;z-index:50;display:none;justify-content:center;align-items:center;gap:12px;
+ background:#7a5a10;color:#fff;padding:8px;font-size:13px}
 button{background:#333;color:var(--fg);border:1px solid #444;border-radius:5px;padding:6px 10px;cursor:pointer;font:inherit}
 button:hover{background:#3d3d3d}button.pri{background:var(--acc);border-color:var(--acc)}
 .row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
@@ -1187,6 +1200,7 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
  #list{width:auto;height:160px;border:0;border-bottom:1px solid var(--line)}
  #stage{height:60vh;flex:none}#side{width:auto;border:0}}
 </style></head><body>
+<div id="outdated">El visor se actualizó mientras tenías la página abierta. <button onclick="location.reload()">Recargar</button></div>
 <div id="list"><div id="listbar"><button id="selall">Todas</button><button id="selnone">Ninguna</button>
  <button id="selinv">Invertir</button><span id="selcount"></span></div><div id="items"></div></div>
 <div id="main">
@@ -1222,6 +1236,11 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
  <progress id="prog" value="0" max="1" hidden></progress><div id="jobmsg">Marcá fotos en la lista (Mayús+clic marca un rango).</div></div>
 <script>
 const $=id=>document.getElementById(id);
+// si el servidor se actualizó con la página abierta, el código de la página quedó viejo:
+// avisar para recargar (si no, partes nuevas, como estados de las barras, no se entienden)
+const VER='__VERSION__',CID=Math.random().toString(36).slice(2,10),_fetch=window.fetch.bind(window);
+window.fetch=(...a)=>_fetch(...a).then(r=>{const v=r.headers.get('X-Viewer');if(v&&v!=VER)$('outdated').style.display='flex';return r});
+setInterval(()=>fetch('/api/presets').catch(()=>{}),30000);  // detectar la actualización aunque no se toque nada
 const CTL=[["strength","Mejora automática",0,2,.05],["brightness","Brillo",-100,100,1],["contrast","Contraste",-100,100,1],
  ["saturation","Saturación",-100,100,1],["warmth","Calidez",-100,100,1],["gamma","Gamma (sombras)",.3,3,.05],["sharpness","Nitidez",0,100,1],
  ["scene_amount","Intensidad del perfil",0,1.5,.05]];
@@ -1231,7 +1250,7 @@ let busy=false,again=false,shown='',hiTimer=0,lastInput=0;
 const S=$('stage'),C=$('canvas'),B=$('before'),A=$('after');
 
 CTL.forEach(([k,l,lo,hi,st])=>{const c=document.createElement('div');c.className='ctl';
- c.innerHTML=`<label for="c_${k}">${l}<span id="v_${k}"></span></label><input type="range" id="c_${k}" min="${lo}" max="${hi}" step="${st}">`;
+ c.innerHTML=`<label for="c_${k}">${l}<span id="v_${k}"></span></label><div class="trk"><input type="range" id="c_${k}" min="${lo}" max="${hi}" step="${st}"><i class="scan"></i></div>`;
  $('ctls').append(c);const r=c.querySelector('input');
  r.oninput=()=>{p[k]=+r.value;$('v_'+k).textContent=r.value;pickPreset();dirty=true;lastInput=performance.now();safeStale();schedule()};
  r.ondblclick=()=>{p[k]=defs[k];sync();dirty=true;schedule()}});
@@ -1347,7 +1366,7 @@ function safeStale(){$('ctls').classList.add('stale');$('safeupd').textContent='
 function safeLater(){clearTimeout(sTimer);sTimer=setTimeout(loadSafe,250)}
 function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey){$('ctls').classList.remove('stale');$('safeupd').textContent='';return}
  sKey=key;const at=key;safeStale();
- fetch('/api/safe?name='+encodeURIComponent(photos[i].name)+'&'+q()).then(r=>r.json()).then(j=>{if(at!=sKey||j.stale)return;
+ fetch('/api/safe?name='+encodeURIComponent(photos[i].name)+'&cid='+CID+'&'+q()).then(r=>r.json()).then(j=>{if(at!=sKey||j.stale)return;
   const t=j._total||{},w=$('safewarn'),
    vis=['luces','sombras','color'].filter(n=>t[n]&&t[n].level=='vis'),tol=['luces','sombras','color'].filter(n=>t[n]&&t[n].level=='tol');
   w.style.color=vis.length?'#e88':'#d8c070';
@@ -1355,7 +1374,8 @@ function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey){$('ctls').cla
    tol.length?'Recorte tolerable (chico y disperso): '+tol.map(n=>`${n} +${t[n].total.toFixed(2)}%`).join(', ')+'.':'';
   CTL.forEach(([k,,lo,hi])=>{const el=$('c_'+k),segs=j[k];if(!segs){el.style.removeProperty('--safe');return}
    const pos=v=>Math.max(0,Math.min(100,(v-lo)/(hi-lo)*100)),st=[];
-   segs.forEach(([a,b,s])=>st.push(`${SAFE_COL[s]} ${pos(a)}%`,`${SAFE_COL[s]} ${pos(b)}%`));
+   // estado desconocido -> gris: un color inválido haría que el navegador no dibuje la barra
+   segs.forEach(([a,b,s])=>{const c=SAFE_COL[s]||'#555';st.push(`${c} ${pos(a)}%`,`${c} ${pos(b)}%`)});
    el.style.setProperty('--safe',`linear-gradient(to right,${st.join(',')})`)});
   $('ctls').classList.remove('stale');$('safeupd').textContent=''}).catch(()=>{})}
 function err(t){const e=$('err');e.textContent=t;e.style.display='block'}
@@ -1890,6 +1910,11 @@ def tune_cancel():
         return "No hay ninguna búsqueda en curso."
     _tune_job["cancel"] = True
     return "Se detendrá al terminar la foto en curso."
+
+
+import hashlib  # noqa: E402
+
+VIEWER_VERSION = hashlib.sha1(_VIEWER.encode()).hexdigest()[:10]
 
 
 if __name__ == "__main__":

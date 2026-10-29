@@ -826,6 +826,9 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path == "/api/save":
                 name, p = self._name(body.get("name", "")), _params(body.get("params", {}))
+                if _job["running"] and name in _job["names"]:
+                    raise RuntimeError("Esta foto está en el lote que se está aplicando y se guardaría con "
+                                       "esos valores. Esperá a que termine o cancelalo, y volvé a guardar.")
                 _apply_one(_viewer["src"], _viewer["dst"], name, p)
                 self._json({"ok": True, "params": p})
             elif path == "/api/apply":
@@ -1083,7 +1086,9 @@ async function watchJob(){$('apply').disabled=true;$('cancel').hidden=false;$('p
  $('apply').disabled=false;$('cancel').hidden=true;$('prog').hidden=true}
 async function refresh(names){const j=await (await fetch('/api/list')).json();
  j.photos.forEach((ph,k)=>{if(photos[k]&&photos[k].name==ph.name){photos[k].params=ph.params;photos[k].edited=ph.edited}});
- marks();if(names.includes(photos[i].name)){ver++;p={...defs,...(photos[i].params||{})};sync();dirty=false;shown='';loadAfter()}}
+ marks();if(!names.includes(photos[i].name))return;ver++;
+ if(dirty)return msg('Esta foto se guardó con los valores del lote; tus cambios sin guardar siguen en pantalla.');
+ p={...defs,...(photos[i].params||{})};sync();dirty=false;shown='';loadAfter()}
 fetch('/api/job').then(r=>r.json()).then(j=>{if(j.running)watchJob()}).catch(()=>{});
 
 function show(k){i=(k+photos.length)%photos.length;const ph=photos[i];

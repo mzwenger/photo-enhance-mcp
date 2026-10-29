@@ -181,7 +181,7 @@ def colorize(img_bgr: np.ndarray) -> np.ndarray:
     orig_l = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)[:, :, :1]
     l512 = cv2.cvtColor(cv2.resize(img, (512, 512)), cv2.COLOR_BGR2Lab)[:, :, :1]
     gray = cv2.cvtColor(np.concatenate([l512, np.zeros_like(l512), np.zeros_like(l512)], -1), cv2.COLOR_LAB2RGB)
-    ab = next(iter(net([gray.transpose(2, 0, 1)[None]]).values()))[0].transpose(1, 2, 0)
+    ab = net(gray.transpose(2, 0, 1)[None])["out"][0].transpose(1, 2, 0)
     ab = cv2.resize(ab, (W, H), interpolation=cv2.INTER_CUBIC)
     out = cv2.cvtColor(np.concatenate([orig_l, ab], -1), cv2.COLOR_LAB2BGR)
     return np.clip(out * 255, 0, 255).round().astype(np.uint8)

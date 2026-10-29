@@ -1,0 +1,12 @@
+# PyTorch se instala aparte (setup.sh usa la versión para CPU):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+mcp>=2.3,<3
+numpy>=2.0
+opencv-python-headless>=4.10
+pillow>=10
+openvino>=2025.0
+onnxruntime>=1.20
+rembg>=2.0.60
+pyiqa>=0.1.13
+transformers>=4.40
+openai-clip>=1.0.1

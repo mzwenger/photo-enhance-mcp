@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+# modelos y binarios: los descarga setup.sh
+models/
+bin/
+vendor/
+# datos locales
+presets.json
+viewer.log
+*.bak
+*.part

@@ -1079,7 +1079,13 @@ body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-seri
  color:#111;display:flex;align-items:center;justify-content:center;cursor:ew-resize;font-size:14px;box-shadow:0 0 6px #000}
 .tag{position:absolute;top:8px;background:#000b;padding:3px 8px;border-radius:4px;pointer-events:none}
 #err{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:80%;background:#a22;padding:12px 16px;border-radius:6px;display:none}
-#busy{position:absolute;right:8px;bottom:8px;background:#000b;padding:3px 8px;border-radius:4px;display:none}
+#spin{position:absolute;top:50%;display:none;flex-direction:column;align-items:center;gap:8px;
+ transform:translate(-50%,-50%);pointer-events:none;z-index:5}
+#spin .w{width:44px;height:44px;border:4px solid #ffffff40;border-top-color:#fff;border-radius:50%;
+ animation:sp .8s linear infinite;box-shadow:0 0 10px #0009}
+#spin span{background:#000b;padding:2px 8px;border-radius:4px;font-size:12px}
+@keyframes sp{to{transform:rotate(360deg)}}
+#after.working{filter:brightness(.7)}
 #side{width:250px;flex-shrink:0;border-left:1px solid var(--line);background:var(--panel);padding:12px;overflow-y:auto}
 #side h3{margin:0 0 10px;font-size:13px}
 .ctl{margin-bottom:12px}.ctl label{display:flex;justify-content:space-between;margin-bottom:3px}
@@ -1117,7 +1123,7 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
  <div id="stage"><div id="canvas"><img id="before" alt=""><img id="after" alt=""></div>
   <div id="line"></div><div id="handle">⇔</div>
   <span class="tag" style="left:8px">Original</span><span class="tag" id="rtag" style="right:8px">Editada</span>
-  <div id="err"></div><div id="busy">procesando…</div></div>
+  <div id="err"></div><div id="spin"><div class="w"></div><span id="spintxt">procesando…</span></div></div>
 </div>
 <div id="side"><h3>Histograma</h3>
  <div class="seg"><button id="h_after" class="on">Editada</button><button id="h_before">Original</button><button id="h_both">Ambas</button></div>
@@ -1244,16 +1250,21 @@ function loadAfter(){if(busy){again=true;return}
  const w=live&&performance.now()-lastInput<300?Math.min(res,1600):res;
  const url=live?`/preview?name=${n}&w=${w}&${q()}`:`/img/edited/${n}?w=${w}&v=${ver}`;
  $('rtag').textContent=live?'Vista previa':'Editada';
- if(url==shown)return;busy=true;again=false;$('busy').style.display='block';
+ if(url==shown)return;busy=true;again=false;spinOn('procesando…');
  const im=new Image();
  im.onload=()=>{if(at==i){A.src=url;shown=url;A.style.visibility='visible';$('err').style.display='none';hist.after=histo(im);drawHist();safeLater()}done()};
  // la imagen no dice por qué falló: se repite el pedido para leer el error, o avisar si el visor está apagado
  im.onerror=()=>{if(at==i)fetch(url).then(r=>r.json()).then(j=>err('No se pudo generar la imagen editada: '+(j.error||'error desconocido')))
   .catch(down);done()};
- function done(){busy=false;$('busy').style.display='none';
+ function done(){busy=false;spinOff();
   if(again||at!=i)loadAfter();else if(w<res){clearTimeout(hiTimer);hiTimer=setTimeout(loadAfter,350)}}
  im.src=url}
 function schedule(){clearTimeout(pTimer);pTimer=setTimeout(loadAfter,0)}
+// spinner sobre el lado mejorado (a la derecha del divisor) mientras se procesa o se guarda
+let spinN=0;
+function spinOn(t){spinN++;$('spintxt').textContent=t;$('spin').style.display='flex';A.classList.add('working');placeSpin()}
+function spinOff(){spinN=Math.max(0,spinN-1);if(!spinN){$('spin').style.display='none';A.classList.remove('working')}}
+function placeSpin(){const r=S.getBoundingClientRect(),sx=d*r.width;$('spin').style.left=((sx+r.width)/2)+'px'}
 // rangos sin pérdida: el servidor prueba valores de cada control y la barra se pinta verde/rojo
 let sTimer=0,sKey='';
 function safeLater(){clearTimeout(sTimer);sTimer=setTimeout(loadSafe,700)}
@@ -1320,7 +1331,7 @@ function fit(){const r=S.getBoundingClientRect();fw=Math.min(r.width,r.height*ar
  C.style.width=fw+'px';C.style.height=fh+'px';z=1;tx=(r.width-fw)/2;ty=(r.height-fh)/2;draw()}
 function clamp(){const r=S.getBoundingClientRect(),W=fw*z,H=fh*z;
  tx=W<=r.width?(r.width-W)/2:Math.min(0,Math.max(r.width-W,tx));ty=H<=r.height?(r.height-H)/2:Math.min(0,Math.max(r.height-H,ty))}
-function draw(){C.style.transform=`translate(${tx}px,${ty}px) scale(${z})`;const r=S.getBoundingClientRect(),sx=d*r.width;
+function draw(){C.style.transform=`translate(${tx}px,${ty}px) scale(${z})`;const r=S.getBoundingClientRect(),sx=d*r.width;placeSpin();
  const pc=Math.max(0,Math.min(100,(sx-tx)/(fw*z)*100));A.style.clipPath=`inset(0 0 0 ${pc}%)`;
  $('line').style.left=$('handle').style.left=sx+'px';$('zoom').textContent=Math.round(z*fw*devicePixelRatio/fullW*100)+'%';
  clearTimeout(rTimer);rTimer=setTimeout(()=>load(false),250)}
@@ -1346,10 +1357,10 @@ onkeydown=e=>{if(['INPUT','SELECT','BUTTON'].includes(e.target.tagName))return;
 $('reset').onclick=()=>{p={...defs};sync();dirty=true;schedule()};
 $('copy').onclick=()=>{clip={...p};msg('Ajustes copiados.')};
 $('paste').onclick=()=>{if(!clip)return msg('Primero copiá ajustes de otra foto.');p={...clip};sync();dirty=true;schedule()};
-$('save').onclick=async()=>{const ph=photos[i];msg('Guardando a resolución completa…');$('save').disabled=true;
+$('save').onclick=async()=>{const ph=photos[i];msg('Guardando a resolución completa…');$('save').disabled=true;spinOn('guardando…');
  try{const r=await fetch('/api/save',{method:'POST',body:JSON.stringify({name:ph.name,params:p})});const j=await r.json();
   if(!r.ok)throw new Error(j.error);ph.params=j.params;ph.edited=true;dirty=false;ver++;marks();loadAfter();msg('Guardada en la carpeta de editadas.')}
- catch(x){msg('Error al guardar: '+x.message)}finally{$('save').disabled=false}};
+ catch(x){msg('Error al guardar: '+x.message)}finally{$('save').disabled=false;spinOff()}};
 </script></body></html>"""
 
 

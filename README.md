@@ -14,6 +14,7 @@ opcional vía OpenVINO/Vulkan), sin enviar fotos a ningún servicio.
 |---|---|---|
 | `enhance_scene` | Mejora natural según la escena (nublado, noche, atardecer, interior, contraluz, niebla, retrato, sol fuerte) o detección automática | Filtro guiado + CLIP |
 | `detect_scene`, `list_scenes` | Detecta el tipo de escena (CLIP + EXIF + histograma) | CLIP ViT-B/32 |
+| `save_scene_profile`, `delete_scene_profile` | Perfiles de escena propios con parámetros finos (luces, sombras, calidez, bruma…), guardados en `profiles.json` | — |
 | `best_enhance` | Prueba varias combinaciones, las puntúa con IA y aplica la mejor | todas + pyiqa |
 | `ai_retouch` | Retoque de color y exposición aprendido de fotógrafos (MIT-Adobe FiveK) | Image-Adaptive 3D LUT |
 | `ai_restore` | Restauración por instrucción en inglés: ruido, desenfoque, poca luz, neblina, lluvia | InstructIR |

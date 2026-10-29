@@ -603,6 +603,7 @@ def _params(raw: dict) -> dict:
 
 def _scenes():
     import scenes
+    scenes.sync_profiles()  # perfiles personalizados guardados por otro proceso
     return scenes
 
 
@@ -1246,8 +1247,45 @@ def colorize(path: str, output_path: str | None = None):
 
 @_tool
 def list_scenes():
-    """Lista los perfiles de escena disponibles para enhance_scene y save_preset."""
-    return "\n".join(f"{k}: {v['label']}" for k, v in _scenes().PROFILES.items())
+    """Lista los perfiles de escena (de fábrica y personalizados) para enhance_scene y save_preset."""
+    sc = _scenes()
+    out = []
+    for k, v in sc.PROFILES.items():
+        line = f"{k}: {v['label']}"
+        if v.get("custom"):
+            line += " [personalizado, base " + v.get("base", "general") + "] " + ", ".join(
+                f"{p}={v[p]:g}" for p in sc.RANGES)
+        out.append(line)
+    return "\n".join(out)
+
+
+@_tool
+def save_scene_profile(name: str, label: str = "", base: str = "nublado", wb: float | None = None,
+                       warmth: float | None = None, exposure: float | None = None, target: float | None = None,
+                       shadows: float | None = None, highlights: float | None = None, clarity: float | None = None,
+                       contrast: float | None = None, dehaze: float | None = None, vibrance: float | None = None,
+                       denoise: float | None = None, sharpen: float | None = None):
+    """Guarda un perfil de escena personalizado (como los de fábrica, con parámetros finos).
+    Parte del perfil `base` y cambia solo los parámetros indicados. Queda disponible en el
+    visor, en enhance_scene y en save_preset (scene=name).
+
+    name: identificador en minúsculas (ej. "nublado-iguazu"); label: nombre visible.
+    wb 0..1 corrección de tinte · warmth -20..20 · exposure 0..1 · target 0.2..0.7 tono medio
+    objetivo · shadows/highlights 0..1 luz local · clarity -0.5..1 · contrast -0.3..1 ·
+    dehaze 0..1 · vibrance 0..1 · denoise 0..3 · sharpen 0..1.5.
+    """
+    params = dict(wb=wb, warmth=warmth, exposure=exposure, target=target, shadows=shadows,
+                  highlights=highlights, clarity=clarity, contrast=contrast, dehaze=dehaze,
+                  vibrance=vibrance, denoise=denoise, sharpen=sharpen)
+    prof = _scenes().save_profile(name, label, base, **{k: v for k, v in params.items() if v is not None})
+    return f"Perfil '{name}' ({prof['label']}) guardado: " + ", ".join(f"{k}={prof[k]:g}" for k in _scenes().RANGES)
+
+
+@_tool
+def delete_scene_profile(name: str):
+    """Borra un perfil de escena personalizado (los de fábrica no se pueden borrar)."""
+    _scenes().delete_profile(name)
+    return f"Perfil '{name}' borrado."
 
 
 @_tool

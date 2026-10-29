@@ -11,8 +11,12 @@ histograma.
 """
 
 import contextlib
+import json
+import os
+import re
 import sys
 import threading
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -44,6 +48,74 @@ PROFILES = {
     "retrato":   dict(label="Retrato", wb=.5, warmth=1, exposure=.4, target=.48, shadows=.3, highlights=.3,
                       clarity=-.1, contrast=.05, dehaze=0, vibrance=.15, denoise=1.0, sharpen=.25),
 }
+BUILTIN = frozenset(PROFILES)
+
+# ---------- perfiles personalizados ----------
+# Se guardan en profiles.json junto al código y se suman a PROFILES. Varios procesos (el MCP
+# y el visor) pueden usarlos: cada uno relee el archivo cuando cambia.
+USER_FILE = Path(__file__).resolve().parent / "profiles.json"
+RANGES = {"wb": (0, 1), "warmth": (-20, 20), "exposure": (0, 1), "target": (.2, .7), "shadows": (0, 1),
+          "highlights": (0, 1), "clarity": (-.5, 1), "contrast": (-.3, 1), "dehaze": (0, 1), "vibrance": (0, 1),
+          "denoise": (0, 3), "sharpen": (0, 1.5)}
+_user_mtime = None
+_user_lock = threading.Lock()
+
+
+def sync_profiles() -> None:
+    """Relee profiles.json si cambió desde la última vez."""
+    global _user_mtime
+    with _user_lock:
+        mtime = USER_FILE.stat().st_mtime if USER_FILE.is_file() else None
+        if mtime == _user_mtime:
+            return
+        for k in [k for k in PROFILES if k not in BUILTIN]:
+            del PROFILES[k]
+        if mtime is not None:
+            for k, v in json.loads(USER_FILE.read_text()).items():
+                if k not in BUILTIN:
+                    PROFILES[k] = {**PROFILES["general"], **v, "custom": True}
+        _user_mtime = mtime
+
+
+def save_profile(key: str, label: str, base: str = "general", **params) -> dict:
+    """Crea o reemplaza un perfil personalizado: parte de `base` y cambia los parámetros dados
+    (limitados a RANGES). Devuelve el perfil guardado."""
+    sync_profiles()
+    key = key.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,40}", key):
+        raise ValueError("El nombre del perfil va en minúsculas, sin espacios (letras, números, - o _)")
+    if key in BUILTIN or key == "auto":
+        raise ValueError(f"'{key}' es un perfil de fábrica; elegí otro nombre")
+    if base not in PROFILES:
+        raise ValueError(f"Perfil base desconocido '{base}'")
+    unknown = set(params) - set(RANGES)
+    if unknown:
+        raise ValueError(f"Parámetros desconocidos: {', '.join(sorted(unknown))}")
+    prof = {k: v for k, v in PROFILES[base].items() if k in RANGES}
+    prof.update({k: float(np.clip(v, *RANGES[k])) for k, v in params.items() if v is not None})
+    prof["label"] = label.strip() or key
+    prof["base"] = base
+    with _user_lock:
+        data = json.loads(USER_FILE.read_text()) if USER_FILE.is_file() else {}
+        data[key] = prof
+        tmp = USER_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+        os.replace(tmp, USER_FILE)
+    sync_profiles()
+    return prof
+
+
+def delete_profile(key: str) -> None:
+    sync_profiles()
+    if key in BUILTIN:
+        raise ValueError(f"'{key}' es un perfil de fábrica y no se puede borrar")
+    with _user_lock:
+        data = json.loads(USER_FILE.read_text()) if USER_FILE.is_file() else {}
+        if key not in data:
+            raise ValueError(f"No existe el perfil personalizado '{key}'")
+        del data[key]
+        USER_FILE.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+    sync_profiles()
 
 
 # ---------- bloques ----------
@@ -139,6 +211,7 @@ def _dehaze(rgb: np.ndarray, amount: float, r: int) -> np.ndarray:
 
 def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale: float = 1.0) -> np.ndarray:
     """Aplica el perfil de escena. scale = ancho de img / ancho de la foto completa."""
+    sync_profiles()
     P = PROFILES.get(scene, PROFILES["general"])
     k = float(np.clip(amount, 0, 1.5))
     if k == 0:

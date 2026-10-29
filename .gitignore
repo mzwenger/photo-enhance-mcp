@@ -7,6 +7,7 @@ bin/
 vendor/
 # datos locales
 presets.json
+profiles.json
 viewer.log
 *.bak
 *.part

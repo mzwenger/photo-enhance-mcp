@@ -43,7 +43,7 @@ otras versiones. Todas aceptan otra carpeta o ruta de salida si se indica.
 
 - Deslizador antes/después con zoom y paneo.
 - Histograma RGB y de luminosidad con recorte de sombras, luces y color medido por canal, y comparación con la original.
-- Cada control muestra en su barra el rango sin pérdida (verde) y dónde empieza a recortar luces, sombras o color (rojo).
+- Cada control muestra en su barra: verde sin recorte, amarillo recorte tolerable (manchas chicas y dispersas, como reflejos), rojo recorte visible (zonas continuas, como un cielo quemado) y gris recorte visible causado por otros ajustes. Los umbrales están en `clipping.py`.
 - Perfiles de escena (automático o manual) con intensidad regulable.
 - Controles en vivo: mejora automática, brillo, contraste, saturación, calidez, gamma, nitidez.
 - Ajustes guardados con nombre y aplicación en lote a las fotos seleccionadas.
@@ -117,6 +117,7 @@ Después pedile al agente cosas como *"mejorá las fotos de ~/Fotos/viaje con el
 server.py       servidor MCP, herramientas clásicas y visor web
 scenes.py       mejora natural por escena y detección de escena
 autotune.py     búsqueda determinista de parámetros óptimos
+clipping.py     recorte tolerable vs visible (tamaño de mancha y total por tipo)
 ai_enhance.py   3D LUT, InstructIR, DDColor y puntaje de calidad
 ai/instructir/  arquitectura de InstructIR (MIT, ver su LICENSE)
 setup.sh        instalación y descarga de modelos

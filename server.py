@@ -759,11 +759,11 @@ _safe_gen = {"n": 0}  # cada pedido nuevo deja obsoletos los anteriores (el usua
 def _safe_ranges(path: Path, p: dict) -> dict:
     """Rango sin pérdida de cada control, con el resto de los ajustes como están.
 
-    Para cada valor del control se mira la foto completa resultante:
+    Para cada valor del control se mira la foto completa resultante (ver clipping.py):
       ok    - no recorta luces, sombras ni color más que la foto original;
-      other - recorta más que la original, pero no más que con este control en neutro
-              (la pérdida viene de otros ajustes);
-      bad   - este control agrega recorte.
+      tol   - recorta más, pero en manchas chicas y dispersas (reflejos, brillos): no se nota;
+      bad   - recorte visible causado por este control;
+      other - recorte visible que viene de otros ajustes (con este control en neutro ya está).
     13 valores por control y, donde cambia el estado, el límite exacto por bisección.
     Brillo, contraste, saturación, calidez y gamma actúan píxel a píxel: se miden sobre una
     muestra de píxeles de la vista de 1600 px (achicar la imagen promedia las zonas quemadas
@@ -774,11 +774,14 @@ def _safe_ranges(path: Path, p: dict) -> dict:
     sc = _scenes()
     scene = (_scene_for(path)[0] if p.get("scene") == "auto" else p.get("scene")) or None
 
+    import clipping
+
     def worse(a, b):  # a recorta más que b
         return a[0] > b[0] + .1 or a[1] > b[1] + .1 or a[2] > b[2] + .2
 
     # versión chica, para los controles espaciales
     img, scale = _base(path, SAFE_SIDE)
+    orig_m = clipping.masks(img)
     scened = lambda amount: (sc.enhance(img, scene, amount, scale, p.get("scene_params"))
                              if scene and amount else img)
     orig = _clip_stats(img)
@@ -790,27 +793,31 @@ def _safe_ranges(path: Path, p: dict) -> dict:
         if scene and p.get("scene_amount", 1.0) else big
     if p["strength"] > 0:
         bstage = _enhance(bstage, p["strength"], bscale)
-    sample = bstage[::3, ::3].reshape(1, -1, 3)
-    orig_big = _clip_stats(big[::3, ::3].reshape(1, -1, 3))
+    sample = bstage[::3, ::3]  # se mantiene la forma: las manchas de recorte se miden por vecindad
+    orig_big_m = clipping.masks(big[::3, ::3])
     out = {}
     for k, (default, lo, hi) in _PARAMS.items():
         if k == "scene_amount" and not scene:
             continue
-        ref = orig
+        om = orig_m
         if k == "scene_amount":
             run = lambda v: _post(scened(float(v)), p, scale)
         elif k in _POINTWISE:
-            ref = orig_big
+            om = orig_big_m
             run = lambda v, k=k: _adjust(sample, **{**{x: p[x] for x in _POINTWISE}, k: float(v)})
         else:
             run = lambda v, k=k: _post(stage, {**p, k: float(v)}, scale)
-        neutral = _clip_stats(run(_NEUTRAL[k]))
+        nimg = run(_NEUTRAL[k])
+        neutral, neutral_vis = _clip_stats(nimg), clipping.assess(nimg, om)["level"] == "vis"
 
-        def state(v):
+        def state(v, om=om, run=run, neutral=neutral, neutral_vis=neutral_vis):
             if _safe_gen["n"] != gen:
                 raise _Superseded()
-            c = _clip_stats(run(v))
-            return "ok" if not worse(c, ref) else ("other" if not worse(c, neutral) else "bad")
+            r = run(v)
+            lvl = clipping.assess(r, om)["level"]
+            if lvl != "vis":
+                return "ok" if lvl == "none" else "tol"
+            return "other" if neutral_vis and not worse(_clip_stats(r), neutral) else "bad"
 
         vals = [float(v) for v in np.linspace(lo, hi, SAFE_STEPS)]
         states = [state(v) for v in vals]
@@ -830,9 +837,10 @@ def _safe_ranges(path: Path, p: dict) -> dict:
                 a = b
         segs.append([round(a, 4), hi, states[-1]])
         out[k] = segs
-    c = _clip_stats(_post(stage, p, scale))
-    out["_total"] = {"luces": round(c[0] - orig[0], 2), "sombras": round(c[1] - orig[1], 2),
-                     "color": round(c[2] - orig[2], 2)}
+    cur = _adjust(sample, **{x: p[x] for x in _POINTWISE})
+    a = clipping.assess(cur, orig_big_m)
+    out["_total"] = {k: a[k] for k in ("luces", "sombras", "color")}
+    out["_total"]["level"] = a["level"]
     return out
 
 
@@ -1197,9 +1205,10 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
  <select id="scene"><option value="">Sin perfil</option><option value="auto">Automático (detectar escena)</option></select>
  <div id="scenemsg"></div>
  <h3>Ajustes</h3>
- <div id="safelegend" title="Para cada valor del control, con el resto de los ajustes como están: verde = la foto no recorta luces, sombras ni color más que la original; ámbar = recorta, pero por otros ajustes; rojo = este control agrega recorte">
-  <i style="background:#2f8f55"></i>sin pérdida <i style="background:#a8862a;margin-left:6px"></i>pérdida por otros ajustes
-  <i style="background:#9a3b3b;margin-left:6px"></i>este control recorta <span id="safeupd"></span></div>
+ <div id="safelegend" title="Para cada valor del control, con el resto de los ajustes como están. Verde: no recorta luces, sombras ni color más que la original. Amarillo: recorta más, pero en manchas chicas y dispersas (reflejos, brillos) que no se notan. Rojo: recorte visible (zonas continuas, como un cielo quemado) causado por este control. Gris: recorte visible que viene de otros ajustes.">
+  <i style="background:#2f8f55"></i>sin recorte <i style="background:#c8a92e;margin-left:6px"></i>tolerable
+  <i style="background:#9a3b3b;margin-left:6px"></i>visible <i style="background:#5f6b7a;margin-left:6px"></i>visible por otros ajustes
+  <span id="safeupd"></span></div>
  <div id="safewarn" style="color:#e88;font-size:12px;margin:-6px 0 10px"></div>
  <div id="ctls"></div>
  <div class="row"><button class="pri" id="save">Guardar</button><button id="reset">Restablecer</button></div>
@@ -1333,15 +1342,17 @@ function spinOff(){spinN=Math.max(0,spinN-1);if(!spinN){$('spin').style.display=
 function placeSpin(){const r=S.getBoundingClientRect(),sx=d*r.width;$('spin').style.left=((sx+r.width)/2)+'px'}
 // rangos sin pérdida: el servidor prueba valores de cada control y la barra se pinta verde/rojo
 let sTimer=0,sKey='';
-const SAFE_COL={ok:'#2f8f55',other:'#a8862a',bad:'#9a3b3b'};
+const SAFE_COL={ok:'#2f8f55',tol:'#c8a92e',bad:'#9a3b3b',other:'#5f6b7a'};
 function safeStale(){$('ctls').classList.add('stale');$('safeupd').textContent='actualizando…'}
 function safeLater(){clearTimeout(sTimer);sTimer=setTimeout(loadSafe,250)}
 function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey){$('ctls').classList.remove('stale');$('safeupd').textContent='';return}
  sKey=key;const at=key;safeStale();
  fetch('/api/safe?name='+encodeURIComponent(photos[i].name)+'&'+q()).then(r=>r.json()).then(j=>{if(at!=sKey||j.stale)return;
-  const t=j._total||{},extra=[['luces',t.luces],['sombras',t.sombras],['color',t.color]].filter(([,v])=>v>.1);
-  $('safewarn').textContent=extra.length?'Con los ajustes actuales ya se recorta más que la original: '+
-   extra.map(([n,v])=>`${n} +${v.toFixed(1)}%`).join(', ')+'.':'';
+  const t=j._total||{},w=$('safewarn'),
+   vis=['luces','sombras','color'].filter(n=>t[n]&&t[n].level=='vis'),tol=['luces','sombras','color'].filter(n=>t[n]&&t[n].level=='tol');
+  w.style.color=vis.length?'#e88':'#d8c070';
+  w.textContent=vis.length?'Recorte visible con los ajustes actuales: '+vis.map(n=>`${n} +${t[n].total.toFixed(1)}% (mancha mayor ${t[n].largest.toFixed(2)}%)`).join(', ')+'.':
+   tol.length?'Recorte tolerable (chico y disperso): '+tol.map(n=>`${n} +${t[n].total.toFixed(2)}%`).join(', ')+'.':'';
   CTL.forEach(([k,,lo,hi])=>{const el=$('c_'+k),segs=j[k];if(!segs){el.style.removeProperty('--safe');return}
    const pos=v=>Math.max(0,Math.min(100,(v-lo)/(hi-lo)*100)),st=[];
    segs.forEach(([a,b,s])=>st.push(`${SAFE_COL[s]} ${pos(a)}%`,`${SAFE_COL[s]} ${pos(b)}%`));

@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 import ai_enhance as A
+import clipping
 import scenes as SC
 
 TUNE_SIDE = 900
@@ -74,6 +75,7 @@ class Reference:
         L, a, b = _lab_full(self.small)
         self.zones = {"sombras": L < .28, "medios": (L >= .28) & (L < .72), "luces": L >= .72}
         self.whites = L > .85
+        self.clip_masks = clipping.masks(self.small)
         chroma = np.hypot(a, b)
         self.colored = chroma > 10  # píxeles con color definido, para medir el giro de tono
         self.hue = np.arctan2(b, a)
@@ -127,7 +129,11 @@ def evaluate(ref: Reference, img: np.ndarray) -> tuple[float, dict]:
     gains = [np.clip(np.log2(s["zone_det"][z] / max(o["zone_det"][z], 1e-6)), -1, 1) for z in o["zone_det"]]
     detail = 8 * float(np.mean(gains)) if gains else 0.0
     pen = {}
-    pen["recortes"] = 15 * max(0, s["neg"] - o["neg"] - .1) + 15 * max(0, s["alt"] - o["alt"] - .1)
+    # recorte: solo cuenta el visible (manchas continuas o mucho total); reflejos y brillos
+    # chicos y dispersos no se notan y no deben descartar un buen ajuste (ver clipping.py)
+    cl = clipping.assess(img, ref.clip_masks)
+    vis = lambda k: cl[k]["total"] if cl[k]["level"] == "vis" else 0.0
+    pen["recortes"] = 15 * (vis("luces") + vis("sombras"))
     pen["saturación"] = 20 * max(0, s["sat"] / max(o["sat"], 1) - 1.5)
     pen["tinte blancos"] = (2.5 * max(0, abs(s["b_whites"] - o["b_whites"]) - 1.5)
                             if o["b_whites"] is not None else 0.0)
@@ -140,7 +146,7 @@ def evaluate(ref: Reference, img: np.ndarray) -> tuple[float, dict]:
         z_pen += .5 * max(0, -d - down) + .5 * max(0, d - up)
     pen["brillo por zona"] = z_pen
     # pérdida de información de color
-    pen["color recortado"] = 15 * max(0, s["color_clip"] - o["color_clip"] - .2)
+    pen["color recortado"] = 15 * vis("color")
     pen["detalle de color"] = 30 * max(0, .85 - s["color_det"] / max(o["color_det"], 1e-6))
     pen["giro de tono"] = 1.0 * max(0, s["hue_shift"] - 4)
     total = q + detail - sum(pen.values())

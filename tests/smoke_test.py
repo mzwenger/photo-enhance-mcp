@@ -132,6 +132,20 @@ def viewer_tests(fotos: Path):
         check("brightness" in safe and "_total" in safe, "visor: rangos sin pérdida")
         sc = json.loads(get(base + f"/api/scene?{q}")[1])
         check("scene" in sc, f"visor: escena detectada ({sc.get('scene')})")
+        g = "&rot90=90&rotate=3&crop=0.25,0.25,0.5,0.5"
+        info = json.loads(get(base + f"/api/info?{q}{g}")[1])
+        check(info["upscale"] == 2 and info["final_width"] <= info["orig_width"],
+              f"visor: recorte y rotación ({info['width']}x{info['height']} -> {info['final_width']}x{info['final_height']})")
+        st, body, _ = get(base + f"/preview?{q}&w=800{g}")
+        img = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+        check(st == 200 and img.shape[0] > img.shape[1], f"visor: vista previa recortada y girada 90° ({img.shape[1]}x{img.shape[0]})")
+        req = urllib.request.Request(base + "/api/save", method="POST", data=json.dumps(
+            {"name": "fútbol.jpg", "params": {"crop": [0.25, 0.25, 0.5, 0.5], "rotate": 3, "brightness": 5}}).encode())
+        with urllib.request.urlopen(req, timeout=900) as r:
+            check(r.status == 200, "visor: guardar con recorte (reescalado al guardar)")
+        saved = cv2.imdecode(np.fromfile(str(fotos / "mejoradas" / "fútbol.jpg"), np.uint8), cv2.IMREAD_COLOR)
+        # vuelve cerca del tamaño original (al menos 90% del lado largo) sin pasarse
+        check(.9 * 548 <= saved.shape[1] <= 548, f"visor: recorte reescalado cerca del tamaño original ({saved.shape[1]}x{saved.shape[0]})")
     finally:
         proc.terminate()
         try:

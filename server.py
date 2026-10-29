@@ -312,32 +312,7 @@ def upscale(path: str, scale: int = 4, style: str = "photo", output_path: str | 
     if scale not in (2, 3, 4):
         raise ValueError("scale debe ser 2, 3 o 4")
     out = _out_path(path, f"x{scale}", output_path, ".png")
-    orig = _load(path)
-    h, w = orig.shape[:2]
-    img, note = None, ""
-    with tempfile.TemporaryDirectory() as td:
-        src = Path(td) / "in.png"
-        _save(orig, src)
-        if style == "anime":
-            model, s = f"realesr-animevideov3-x{scale}", scale
-        else:
-            model, s = "realesrgan-x4plus", 4
-        tmp = Path(td) / "out.png"
-        err = "no está instalado"
-        if REALESRGAN.is_file():
-            r = subprocess.run([str(REALESRGAN), "-i", str(src), "-o", str(tmp), "-n", model, "-s", str(s)],
-                               cwd=REALESRGAN.parent, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace")
-            if r.returncode == 0 and tmp.exists():
-                img = _imread(tmp)
-            err = (r.stderr or r.stdout or "")[-300:].strip()
-        if img is not None and s != scale:
-            img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_AREA)
-    if img is None:
-        # sin GPU con Vulkan (o sin el binario): reescalado clásico en lugar de fallar
-        img = _sharpen(cv2.resize(orig, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4), .25)
-        note = ("Real-ESRGAN no pudo correr (" + (err.splitlines()[-1] if err else "sin GPU con Vulkan") +
-                "): se usó reescalado clásico (Lanczos), de menor calidad.")
+    img, note = _realesrgan(_load(path), scale, style)  # sin Vulkan: Lanczos con aviso
     _save(img, out)
     return _result(img, out, note)
 
@@ -685,6 +660,148 @@ def _params(raw: dict) -> dict:
     return out
 
 
+# ---------- geometría: girar, enderezar, recortar (solo para una foto, nunca en presets ni lotes) ----------
+
+UPSCALE_BELOW = .7  # si el recorte deja el lado largo por debajo del 70% del original, se reescala al guardar
+
+
+def _geom_params(raw: dict) -> dict:
+    """Geometría de una foto: rot90 (0/90/180/270), rotate (-45..45, enderezar), crop [x,y,ancho,alto]
+    en fracciones de la foto ya girada y enderezada, upcrop (reescalar recortes chicos al guardar)."""
+    g = {}
+    try:
+        r90 = int(float(raw.get("rot90", 0))) % 360
+        g["rot90"] = r90 - r90 % 90
+    except (TypeError, ValueError):
+        g["rot90"] = 0
+    try:
+        g["rotate"] = round(float(np.clip(float(raw.get("rotate", 0)), -45, 45)), 2)
+    except (TypeError, ValueError):
+        g["rotate"] = 0.0
+    c = raw.get("crop")
+    if isinstance(c, str):
+        try:
+            c = [float(x) for x in c.split(",")]
+        except ValueError:
+            c = None
+    if isinstance(c, (list, tuple)) and len(c) == 4:
+        x, y, w, h = (float(np.clip(v, 0, 1)) for v in c)
+        w, h = min(w, 1 - x), min(h, 1 - y)
+        if w > .01 and h > .01 and (w, h) != (1, 1):
+            g["crop"] = [round(x, 5), round(y, 5), round(w, 5), round(h, 5)]
+    up = raw.get("upcrop", 1)
+    g["upcrop"] = 0 if str(up).lower() in ("0", "false", "no") else 1
+    return g
+
+
+def _has_geom(p: dict) -> bool:
+    return bool(p.get("rot90") or p.get("rotate") or p.get("crop"))
+
+
+def _straighten_factor(w: int, h: int, deg: float) -> float:
+    """Escala del rectángulo más grande, con la misma proporción, que entra en la foto girada
+    `deg` grados sin esquinas vacías."""
+    a = np.radians(abs(deg))
+    c, s = np.cos(a), np.sin(a)
+    return float(min(w / (w * c + h * s), h / (w * s + h * c)))
+
+
+def _geom(img: np.ndarray, p: dict, crop: bool = True) -> np.ndarray:
+    """Aplica la geometría (a cualquier resolución: el recorte está en fracciones)."""
+    r90 = p.get("rot90", 0)
+    if r90:
+        img = cv2.rotate(img, {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+                               270: cv2.ROTATE_90_COUNTERCLOCKWISE}[r90])
+    deg = p.get("rotate", 0)
+    if deg:
+        h, w = img.shape[:2]
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), -deg, 1)  # positivo = horario, como en el visor
+        img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+        f = _straighten_factor(w, h, deg)
+        cw, ch = int(w * f), int(h * f)
+        x0, y0 = (w - cw) // 2, (h - ch) // 2
+        img = img[y0:y0 + ch, x0:x0 + cw]
+    if crop and p.get("crop"):
+        h, w = img.shape[:2]
+        x, y, cw, ch = p["crop"]
+        x0, y0 = int(round(x * w)), int(round(y * h))
+        img = img[y0:y0 + max(1, int(round(ch * h))), x0:x0 + max(1, int(round(cw * w)))]
+    return np.ascontiguousarray(img)
+
+
+def _geom_side(path: Path, p: dict, w: int) -> int:
+    """Lado de la versión a cargar para que, después de recortar, queden ~w píxeles de lado largo."""
+    if not _has_geom(p):
+        return w
+    (ow, oh), (cw, ch), _ = _geom_size(path, {**p, "upcrop": 0})
+    need = w * max(ow, oh) / max(cw, ch, 1)
+    full = max(ow, oh)
+    return int(min(full, max(w, round(need / 400) * 400)))
+
+
+def _geom_size(path: Path, p: dict) -> tuple[tuple[int, int], tuple[int, int], int]:
+    """(ancho, alto) original girado, (ancho, alto) tras enderezar y recortar, y el factor de
+    reescalado que se aplicará al guardar (1 si no hace falta)."""
+    with PILImage.open(path) as im:
+        w, h = im.size
+        if im.getexif().get(0x0112) in (5, 6, 7, 8):
+            w, h = h, w
+    if p.get("rot90") in (90, 270):
+        w, h = h, w
+    ow, oh = w, h
+    if p.get("rotate"):
+        f = _straighten_factor(w, h, p["rotate"])
+        w, h = int(w * f), int(h * f)
+    if p.get("crop"):
+        w, h = int(round(p["crop"][2] * w)), int(round(p["crop"][3] * h))
+    up = 1
+    long_o, long_c = max(ow, oh), max(w, h)
+    if p.get("upcrop", 1) and long_c < UPSCALE_BELOW * long_o:
+        up = next((f for f in (2, 3, 4) if long_c * f >= .9 * long_o), 4)
+    return (ow, oh), (w, h), up
+
+
+def _final_size(path: Path, p: dict) -> tuple[int, int]:
+    """Tamaño con el que se guarda: el recorte, y si se reescala, sin pasarse del lado largo original."""
+    (ow, oh), (w, h), up = _geom_size(path, p)
+    if up == 1:
+        return w, h
+    k = min(up, max(ow, oh) / max(w, h))
+    return round(w * k), round(h * k)
+
+
+def _realesrgan(img: np.ndarray, factor: int, style: str = "photo") -> tuple[np.ndarray, str]:
+    """Reescala con Real-ESRGAN (GPU por Vulkan); si no puede correr, Lanczos. Devuelve la
+    imagen y una nota (vacía si se usó Real-ESRGAN)."""
+    h, w = img.shape[:2]
+    out, err = None, "no está instalado"
+    if REALESRGAN.is_file():
+        with tempfile.TemporaryDirectory() as td:
+            src, tmp = Path(td) / "in.png", Path(td) / "out.png"
+            # el modelo de fotos siempre multiplica x4: para x2/x3 se achica antes la entrada, así llega
+            # directo al tamaño final (3-4 veces más rápido que x4 y achicar, y más nítido)
+            inp = img
+            if style != "anime" and factor < 4:
+                inp = cv2.resize(img, (max(1, round(w * factor / 4)), max(1, round(h * factor / 4))),
+                                 interpolation=cv2.INTER_AREA)
+            _save(inp, src)
+            model, s = ((f"realesr-animevideov3-x{factor}", factor) if style == "anime"
+                        else ("realesrgan-x4plus", 4))
+            r = subprocess.run([str(REALESRGAN), "-i", str(src), "-o", str(tmp), "-n", model, "-s", str(s)],
+                               cwd=REALESRGAN.parent, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+            if r.returncode == 0 and tmp.exists():
+                out = _imread(tmp)
+                if out.shape[:2] != (h * factor, w * factor):
+                    out = cv2.resize(out, (w * factor, h * factor), interpolation=cv2.INTER_AREA)
+            err = (r.stderr or r.stdout or "")[-300:].strip()
+    if out is not None:
+        return out, ""
+    out = _sharpen(cv2.resize(img, (w * factor, h * factor), interpolation=cv2.INTER_LANCZOS4), .25)
+    return out, ("Real-ESRGAN no pudo correr (" + (err.splitlines()[-1] if err else "sin GPU con Vulkan") +
+                 "): se usó reescalado clásico (Lanczos), de menor calidad.")
+
+
 def _scenes():
     import scenes
     scenes.sync_profiles()  # perfiles personalizados guardados por otro proceso
@@ -803,8 +920,9 @@ def _safe_ranges(path: Path, p: dict, cid: str = "") -> dict:
     def worse(a, b):  # a recorta más que b
         return a[0] > b[0] + .1 or a[1] > b[1] + .1 or a[2] > b[2] + .2
 
-    # versión chica, para los controles espaciales
-    img, scale = _base(path, SAFE_SIDE)
+    # versión chica, para los controles espaciales (sobre la zona recortada, si hay recorte)
+    img, scale = _base(path, _geom_side(path, p, SAFE_SIDE))
+    img = _geom(img, p) if _has_geom(p) else img
     orig_m = clipping.masks(img)
     scened = lambda amount: (sc.enhance(img, scene, amount, scale, p.get("scene_params"))
                              if scene and amount else img)
@@ -812,7 +930,8 @@ def _safe_ranges(path: Path, p: dict, cid: str = "") -> dict:
     stage = scened(p.get("scene_amount", 1.0))  # el perfil se calcula una vez
     # vista completa, para los controles píxel a píxel: perfil y mejora una vez, después una
     # muestra (1 de cada 9 píxeles, ~190 mil) en forma de imagen de una fila
-    big, bscale = _base(path, SAFE_FULL)
+    big, bscale = _base(path, _geom_side(path, p, SAFE_FULL))
+    big = _geom(big, p) if _has_geom(p) else big
     bstage = sc.enhance(big, scene, p.get("scene_amount", 1.0), bscale, p.get("scene_params")) \
         if scene and p.get("scene_amount", 1.0) else big
     if p["strength"] > 0:
@@ -911,7 +1030,22 @@ def _store_preset(name: str, params: dict | None) -> dict:
 
 
 def _apply_one(src: Path, dst: Path, name: str, p: dict) -> None:
-    _save(_edit(_load(str(src / name)), p, path=src / name), dst / name)
+    if "rot90" not in p:
+        # lotes, presets y auto_tune no traen geometría: se conserva el recorte que ya tenía la foto
+        f = dst / "ajustes.json"
+        prev = (json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}).get(name, {})
+        if _has_geom(prev):
+            p = {**p, **_geom_params(prev)}
+    img = _load(str(src / name))
+    if _has_geom(p):
+        img = _geom(img, p)
+        up = _geom_size(src / name, p)[2]
+        if up > 1:  # recorte chico: volver cerca del tamaño original, sin pasarse
+            img = _realesrgan(img, up)[0]
+            fw, fh = _final_size(src / name, p)
+            if (img.shape[1], img.shape[0]) != (fw, fh):
+                img = cv2.resize(img, (fw, fh), interpolation=cv2.INTER_AREA)
+    _save(_edit(img, p, path=src / name), dst / name)
     _trim_memory()
     with _ajustes_lock:
         f = dst / "ajustes.json"
@@ -993,7 +1127,12 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             if u.path == "/":
                 self._send(_VIEWER.replace("__VERSION__", VIEWER_VERSION).encode(), "text/html; charset=utf-8")
             elif u.path == "/api/info":
-                self._json({"width": _full_width(_viewer["src"] / self._name(q.get("name", "")))})
+                path = _viewer["src"] / self._name(q.get("name", ""))
+                g = _geom_params(q)
+                (ow, oh), (cw, ch), up = _geom_size(path, g)
+                fw, fh = _final_size(path, g)
+                self._json({"width": cw, "height": ch, "orig_width": ow, "orig_height": oh, "upscale": up,
+                            "final_width": fw, "final_height": fh})
             elif u.path == "/api/list":
                 dst = _viewer["dst"]
                 saved = _saved_params()
@@ -1006,16 +1145,25 @@ class _ViewerHandler(BaseHTTPRequestHandler):
                 kind, name = unquote(u.path[5:]).split("/", 1)
                 folder = _viewer["src"] if kind == "original" else _viewer["dst"]
                 w = int(np.clip(int(q.get("w", 1600)), 200, 8000))
-                self._jpeg(_base(folder / self._name(name), w)[0])
+                g = _geom_params(q) if kind == "original" else {}
+                if _has_geom(g) or q.get("nocrop"):  # original con la misma geometría que la editada
+                    path = folder / self._name(name)
+                    img, _ = _base(path, _geom_side(path, g, w))
+                    self._jpeg(_geom(img, g, crop=not q.get("nocrop")))
+                else:
+                    self._jpeg(_base(folder / self._name(name), w)[0])
             elif u.path == "/preview":
                 w = int(np.clip(int(q.get("w", 1600)), 200, 8000))
                 path = _viewer["src"] / self._name(q.get("name", ""))
-                img, scale = _base(path, w)
+                g = _geom_params(q)
+                img, scale = _base(path, _geom_side(path, g, w))
+                if _has_geom(g):
+                    img = _geom(img, g)
                 self._jpeg(_edit(img, _params(q), scale, path))
             elif u.path == "/api/safe":
                 path = _viewer["src"] / self._name(q.get("name", ""))
                 try:
-                    self._json(_safe_ranges(path, _params(q), q.get("cid", "")[:32]))
+                    self._json(_safe_ranges(path, {**_params(q), **_geom_params(q)}, q.get("cid", "")[:32]))
                 except _Superseded:
                     self._json({"stale": True})
             elif u.path == "/api/scene":
@@ -1038,7 +1186,8 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
             path = urlparse(self.path).path
             if path == "/api/save":
-                name, p = self._name(body.get("name", "")), _params(body.get("params", {}))
+                name = self._name(body.get("name", ""))
+                p = {**_params(body.get("params", {})), **_geom_params(body.get("params", {}))}
                 if _job["running"] and name in _job["names"]:
                     raise RuntimeError("Esta foto está en el lote que se está aplicando y se guardaría con "
                                        "esos valores. Esperá a que termine o cancelalo, y volvé a guardar.")
@@ -1201,6 +1350,28 @@ body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-seri
  animation:scan 1.1s ease-in-out infinite}
 #ctls.stale .scan{display:block}
 @keyframes scan{from{background-position:-35% 0}to{background-position:135% 0}}
+/* modo recorte */
+#cropui{position:absolute;inset:0;display:none;background:#111;touch-action:none}
+#stage.cropping #canvas,#stage.cropping #line,#stage.cropping #handle,#stage.cropping .tag{display:none}
+#stage.cropping #cropui{display:block}
+#cropframe{position:absolute;overflow:hidden}
+#cropimg{position:absolute;left:0;top:0;width:100%;height:100%;user-select:none;-webkit-user-drag:none;
+ pointer-events:none;transform-origin:50% 50%}
+/* cuadrícula fina mientras se endereza, para alinear el horizonte */
+#rotgrid{position:absolute;inset:0;display:none;pointer-events:none;
+ background-image:linear-gradient(#ffffff40 1px,transparent 1px),linear-gradient(90deg,#ffffff40 1px,transparent 1px);
+ background-size:100% 8.333%,8.333% 100%}
+#cropui.rotating #rotgrid{display:block}
+#cropbox{position:absolute;box-shadow:0 0 0 9999px #000a;outline:1px solid #fff;cursor:move}
+#cropbox .g{position:absolute;inset:0;pointer-events:none;background-repeat:no-repeat;
+ background-image:linear-gradient(#fff6,#fff6),linear-gradient(#fff6,#fff6),linear-gradient(90deg,#fff6,#fff6),linear-gradient(90deg,#fff6,#fff6);
+ background-size:100% 1px,100% 1px,1px 100%,1px 100%;background-position:0 33.33%,0 66.66%,33.33% 0,66.66% 0}
+.ch{position:absolute;width:14px;height:14px;background:#fff;border:1px solid #222;border-radius:2px;margin:-7px 0 0 -7px}
+.ch.nw{left:0;top:0;cursor:nwse-resize}.ch.n{left:50%;top:0;cursor:ns-resize}.ch.ne{left:100%;top:0;cursor:nesw-resize}
+.ch.e{left:100%;top:50%;cursor:ew-resize}.ch.se{left:100%;top:100%;cursor:nwse-resize}.ch.s{left:50%;top:100%;cursor:ns-resize}
+.ch.sw{left:0;top:100%;cursor:nesw-resize}.ch.w{left:0;top:50%;cursor:ew-resize}
+#croppanel label.chk{display:flex;gap:6px;align-items:flex-start;margin:6px 0;color:var(--fg)}
+#cropinfo,#cropsize{color:var(--dim);margin:2px 0 10px;min-height:1.2em}
 #outdated{position:fixed;top:0;left:0;right:0;z-index:50;display:none;justify-content:center;align-items:center;gap:12px;
  background:#7a5a10;color:#fff;padding:8px;font-size:13px}
 button{background:#333;color:var(--fg);border:1px solid #444;border-radius:5px;padding:6px 10px;cursor:pointer;font:inherit}
@@ -1230,12 +1401,28 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
  <div id="stage"><div id="canvas"><img id="before" alt=""><img id="after" alt=""></div>
   <div id="line"></div><div id="handle">⇔</div>
   <span class="tag" style="left:8px">Original</span><span class="tag" id="rtag" style="right:8px">Editada</span>
+  <div id="cropui"><div id="cropframe"><img id="cropimg" alt=""><div id="rotgrid"></div></div><div id="cropbox"><div class="g"></div>
+   <i class="ch nw" data-h="nw"></i><i class="ch n" data-h="n"></i><i class="ch ne" data-h="ne"></i><i class="ch e" data-h="e"></i>
+   <i class="ch se" data-h="se"></i><i class="ch s" data-h="s"></i><i class="ch sw" data-h="sw"></i><i class="ch w" data-h="w"></i></div></div>
   <div id="err"></div><div id="spin"><div class="w"></div><span id="spintxt">procesando…</span></div></div>
 </div>
 <div id="side"><h3>Histograma</h3>
  <div class="seg"><button id="h_after" class="on">Editada</button><button id="h_before">Original</button><button id="h_both">Ambas</button></div>
  <canvas id="hist" title="Izquierda: sombras · derecha: luces. Rojo, verde y azul por canal; blanco: luminosidad."></canvas>
  <div id="hstats"></div>
+ <h3>Recorte y rotación</h3>
+ <div class="row"><button id="cropbtn">Recortar / rotar</button><button id="cropclear">Quitar</button></div>
+ <div id="cropinfo"></div>
+ <div id="croppanel" hidden>
+  <select id="aspect"><option value="">Proporción libre</option><option value="orig">Original</option><option value="1">1:1</option>
+   <option value="1.3333">4:3</option><option value="1.5">3:2</option><option value="1.7778">16:9</option>
+   <option value="0.8">4:5 (vertical)</option><option value="0.6667">2:3 (vertical)</option></select>
+  <div class="ctl"><label for="crot">Enderezar<span id="crotv">0°</span></label><div class="trk"><input type="range" id="crot" min="-45" max="45" step="0.1"></div></div>
+  <div class="row"><button id="r90l" title="Girar 90° a la izquierda">⟲ 90°</button><button id="r90r" title="Girar 90° a la derecha">⟳ 90°</button><button id="cropfull">Toda la foto</button></div>
+  <label class="chk"><input type="checkbox" id="upcrop" checked> Si el recorte queda chico, reescalarlo con IA al guardar (Real-ESRGAN)</label>
+  <div id="cropsize"></div>
+  <div class="row"><button class="pri" id="cropok">Aplicar</button><button id="cropcancel">Cancelar</button></div>
+ </div>
  <h3>Perfil de escena</h3>
  <select id="scene"><option value="">Sin perfil</option><option value="auto">Automático (detectar escena)</option></select>
  <div id="scenemsg"></div>
@@ -1316,7 +1503,7 @@ $('selinv').onclick=()=>{photos.forEach((_,j)=>sel.has(j)?sel.delete(j):sel.add(
 function loadPresets(pick){return fetch('/api/presets').then(r=>r.json()).then(j=>{presets=j;const s=$('preset');
  s.length=1;Object.keys(j).sort().forEach(n=>s.add(new Option(n,n)));if(pick&&j[pick])s.value=pick;else pickPreset()})}
 loadPresets();
-$('preset').onchange=()=>{const n=$('preset').value;if(!n)return;p={...defs,...presets[n]};sync();dirty=true;schedule();msg(`Cargado "${n}". Guardá esta foto o aplicalo a varias.`)};
+$('preset').onchange=()=>{const n=$('preset').value;if(!n)return;p={...defs,...noGeom(presets[n]),...geomOf(p)};sync();dirty=true;schedule();msg(`Cargado "${n}". Guardá esta foto o aplicalo a varias.`)};
 async function post(url,body){const r=await fetch(url,{method:'POST',body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw new Error(j.error);return j}
 $('psave').onclick=async()=>{const n=prompt('Nombre para estos ajustes:',$('preset').value||'');if(!n||!n.trim())return;
  if(presets[n.trim()]&&!confirm(`Ya existe "${n.trim()}". ¿Reemplazarlo?`))return;
@@ -1346,18 +1533,24 @@ async function refresh(names){const j=await (await fetch('/api/list')).json();
  p={...defs,...(photos[i].params||{})};sync();dirty=false;shown='';loadAfter()}
 fetch('/api/job').then(r=>r.json()).then(j=>{if(j.running)watchJob()}).catch(()=>{});
 
-function show(k){i=(k+photos.length)%photos.length;const ph=photos[i];
+function show(k){if(cropping)cropExit();i=(k+photos.length)%photos.length;const ph=photos[i];
  p={...defs,...(ph.params||{})};sync();dirty=false;res=0;z=1;shown='';A.style.visibility='hidden';
  $('name').textContent=`${ph.name} (${i+1}/${photos.length})`;marks();$('items').children[i].scrollIntoView({block:'nearest'});
  msg(ph.params?'Ajustes guardados con este visor.':ph.edited?'Editada: versión guardada en la carpeta (ajustes desconocidos).':'Sin versión editada todavía.');
- fetch('/api/info?name='+encodeURIComponent(ph.name)).then(r=>r.json()).then(j=>{fullW=j.width||fullW;draw()}).catch(down);
+ infoGeom();
  B.onload=()=>{ar=B.naturalWidth/B.naturalHeight;fit();B.onload=null};load(true)}
 
 function want(){const px=z*fw*devicePixelRatio;return px>4000?8000:px>1700?4000:1600}
+// geometría (recorte y rotación): solo de esta foto
+const GEOM=['rot90','rotate','crop','upcrop'];
+const hasGeom=g=>!!(g.rot90||g.rotate||g.crop);
+function gq(g=p){return hasGeom(g)?`&rot90=${g.rot90||0}&rotate=${g.rotate||0}`+(g.crop?`&crop=${g.crop.join(',')}`:'')+`&upcrop=${g.upcrop===0?0:1}`:''}
+const geomOf=g=>Object.fromEntries(GEOM.filter(k=>g[k]!==undefined).map(k=>[k,g[k]]));
+const noGeom=g=>{const o={...g};GEOM.forEach(k=>delete o[k]);return o};
 function q(){return CTL.map(([k])=>`${k}=${p[k]}`).join('&')+`&scene=${p.scene||''}`+
- (p.scene_params?'&scene_params='+encodeURIComponent(JSON.stringify(p.scene_params)):'')}
+ (p.scene_params?'&scene_params='+encodeURIComponent(JSON.stringify(p.scene_params)):'')+gq()}
 function load(force){const w=want();if(!force&&w==res)return;res=w;const n=encodeURIComponent(photos[i].name);
- B.src=`/img/original/${n}?w=${w}`;loadAfter()}
+ B.src=`/img/original/${n}?w=${w}${gq()}`;loadAfter()}
 // Una sola petición a la vez: mientras se mueve un control se pide una vista rápida
 // (máx. 1600 px) y al soltar, la resolución que pide el zoom.
 function loadAfter(){if(busy){again=true;return}
@@ -1458,9 +1651,9 @@ function draw(){C.style.transform=`translate(${tx}px,${ty}px) scale(${z})`;const
  $('line').style.left=$('handle').style.left=sx+'px';$('zoom').textContent=Math.round(z*fw*devicePixelRatio/fullW*100)+'%';
  clearTimeout(rTimer);rTimer=setTimeout(()=>load(false),250)}
 function zoomAt(nz,mx,my){nz=Math.max(1,Math.min(40,nz));tx=mx-(mx-tx)*nz/z;ty=my-(my-ty)*nz/z;z=nz;clamp();draw()}
-S.addEventListener('wheel',e=>{e.preventDefault();const r=S.getBoundingClientRect();zoomAt(z*Math.exp(-e.deltaY*.0015),e.clientX-r.left,e.clientY-r.top)},{passive:false});
+S.addEventListener('wheel',e=>{e.preventDefault();if(cropping)return;const r=S.getBoundingClientRect();zoomAt(z*Math.exp(-e.deltaY*.0015),e.clientX-r.left,e.clientY-r.top)},{passive:false});
 const pts=new Map();let pinch=null;
-S.onpointerdown=e=>{S.setPointerCapture(e.pointerId);pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+S.onpointerdown=e=>{if(cropping)return;S.setPointerCapture(e.pointerId);pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
  if(pts.size==2){const [a,b]=[...pts.values()];pinch={d:Math.hypot(a.x-b.x,a.y-b.y),z};mode=null;return}
  mode=e.target.id=='handle'?'div':'pan';last={x:e.clientX,y:e.clientY};if(mode=='pan')S.classList.add('panning')};
 S.onpointermove=e=>{if(!pts.has(e.pointerId))return;pts.set(e.pointerId,{x:e.clientX,y:e.clientY});const r=S.getBoundingClientRect();
@@ -1468,21 +1661,89 @@ S.onpointermove=e=>{if(!pts.has(e.pointerId))return;pts.set(e.pointerId,{x:e.cli
  if(mode=='div'){d=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));draw()}
  else if(mode=='pan'){tx+=e.clientX-last.x;ty+=e.clientY-last.y;last={x:e.clientX,y:e.clientY};clamp();draw()}};
 S.onpointerup=S.onpointercancel=e=>{pts.delete(e.pointerId);if(pts.size<2)pinch=null;mode=null;S.classList.remove('panning')};
-S.ondblclick=e=>{if(e.target.id=='handle')return;const r=S.getBoundingClientRect();zoomAt(z>1.5?1:3,e.clientX-r.left,e.clientY-r.top)};
+S.ondblclick=e=>{if(cropping||e.target.id=='handle')return;const r=S.getBoundingClientRect();zoomAt(z>1.5?1:3,e.clientX-r.left,e.clientY-r.top)};
 $('fit').onclick=fit;
 $('z100').onclick=()=>{const r=S.getBoundingClientRect();zoomAt(fullW/(fw*devicePixelRatio),r.width/2,r.height/2)};
 onresize=()=>fit();
-onkeydown=e=>{if(['INPUT','SELECT','BUTTON'].includes(e.target.tagName))return;
+onkeydown=e=>{if(cropping){if(e.key=='Enter')cropApply();else if(e.key=='Escape')cropExit();return}
+ if(['INPUT','SELECT','BUTTON'].includes(e.target.tagName))return;
  if(e.key=='ArrowRight')show(i+1);else if(e.key=='ArrowLeft')show(i-1);else if(e.key=='0')fit();
  else if(e.key==' '){e.preventDefault();d=d>.5?0:1;draw()}};
 
-$('reset').onclick=()=>{p={...defs};sync();dirty=true;schedule()};
-$('copy').onclick=()=>{clip={...p};msg('Ajustes copiados.')};
-$('paste').onclick=()=>{if(!clip)return msg('Primero copiá ajustes de otra foto.');p={...clip};sync();dirty=true;schedule()};
-$('save').onclick=async()=>{const ph=photos[i];msg('Guardando a resolución completa…');$('save').disabled=true;spinOn('guardando…');
+// restablecer, copiar, pegar y presets no tocan el recorte: es de cada foto ("Quitar" lo borra)
+$('reset').onclick=()=>{p={...defs,...geomOf(p)};sync();dirty=true;schedule()};
+$('copy').onclick=()=>{clip=noGeom(p);msg('Ajustes copiados (sin el recorte).')};
+$('paste').onclick=()=>{if(!clip)return msg('Primero copiá ajustes de otra foto.');p={...clip,...geomOf(p)};sync();dirty=true;schedule()};
+$('save').onclick=async()=>{const ph=photos[i];msg(geomUp>1?'Guardando: el recorte se reescala con IA (puede tardar unos minutos)…':'Guardando a resolución completa…');$('save').disabled=true;spinOn('guardando…');
  try{const r=await fetch('/api/save',{method:'POST',body:JSON.stringify({name:ph.name,params:p})});const j=await r.json();
   if(!r.ok)throw new Error(j.error);ph.params=j.params;ph.edited=true;dirty=false;ver++;marks();loadAfter();msg('Guardada en la carpeta de editadas.')}
  catch(x){msg('Error al guardar: '+x.message)}finally{$('save').disabled=false;spinOff()}};
+
+// ---------- recorte y rotación ----------
+let cropping=false,cm=null,geomUp=1,cimgW=1,cimgH=1,ciTimer=0,drag=null;
+const CI=$('cropimg'),CB=$('cropbox'),CU=$('cropui'),CF=$('cropframe');
+// misma cuenta que el servidor (_straighten_factor): zoom para que al girar no queden esquinas vacías
+function straighten(w,h,deg){const a=Math.abs(deg)*Math.PI/180,c=Math.cos(a),s=Math.sin(a);return Math.min(w/(w*c+h*s),h/(w*s+h*c))}
+function applyRot(){CI.style.transform=`rotate(${cm.rotate}deg) scale(${1/straighten(cimgW,cimgH,cm.rotate)})`}
+function infoGeom(g=p,target='cropinfo'){const ph=photos[i];
+ fetch('/api/info?name='+encodeURIComponent(ph.name)+gq(g)).then(r=>r.json()).then(j=>{
+  if(target=='cropinfo'){fullW=j.width||fullW;geomUp=hasGeom(p)?j.upscale:1;draw();
+   $('cropinfo').textContent=hasGeom(p)?`${j.width}×${j.height} px`+(j.upscale>1?` · al guardar se reescala con IA a ${j.final_width}×${j.final_height}`:''):'Sin recorte ni rotación.'}
+  else $('cropsize').textContent=`Resultado: ${j.width}×${j.height} px (${Math.round(100*j.width*j.height/(j.orig_width*j.orig_height))}% del área)`+
+   (j.upscale>1?` → al guardar se reescala con IA a ${j.final_width}×${j.final_height}`:'')}).catch(()=>{})}
+function cropEnter(){if(cropping)return;cropping=true;cm={rot90:p.rot90||0,rotate:p.rotate||0,crop:p.crop?[...p.crop]:[0,0,1,1],upcrop:p.upcrop===0?0:1};
+ $('crot').value=cm.rotate;$('crotv').textContent=cm.rotate+'°';$('upcrop').checked=!!cm.upcrop;$('aspect').value='';
+ S.classList.add('cropping');$('croppanel').hidden=false;$('cropbtn').disabled=true;cropImage()}
+function cropExit(){cropping=false;cm=null;S.classList.remove('cropping');$('croppanel').hidden=true;$('cropbtn').disabled=false;fit()}
+// la foto se carga sin enderezar (solo con el giro de 90°): el enderezado se ve en tiempo real
+function cropImage(){const n=encodeURIComponent(photos[i].name);
+ CI.onload=()=>{cimgW=CI.naturalWidth;cimgH=CI.naturalHeight;applyRot();cropLayout()};
+ CI.src=`/img/original/${n}?w=1600&nocrop=1&rot90=${cm.rot90}`}
+function cropLayout(){const r=S.getBoundingClientRect(),k=Math.min((r.width-40)/cimgW,(r.height-40)/cimgH);
+ const w=cimgW*k,h=cimgH*k;Object.assign(CF.style,{width:w+'px',height:h+'px',left:(r.width-w)/2+'px',top:(r.height-h)/2+'px'});cropBox()}
+function cropBox(){const [x,y,w,h]=cm.crop,L=parseFloat(CF.style.left),T=parseFloat(CF.style.top),W=parseFloat(CF.style.width),H=parseFloat(CF.style.height);
+ Object.assign(CB.style,{left:L+x*W+'px',top:T+y*H+'px',width:w*W+'px',height:h*H+'px'});
+ clearTimeout(ciTimer);ciTimer=setTimeout(()=>infoGeom(cmGeom(),'cropsize'),150)}
+const cmGeom=()=>({rot90:cm.rot90,rotate:cm.rotate,crop:isFull(cm.crop)?null:cm.crop,upcrop:cm.upcrop});
+const isFull=c=>c[0]<.001&&c[1]<.001&&c[2]>.999&&c[3]>.999;
+// proporción pedida, en unidades normalizadas (ancho/alto relativos a la foto girada)
+function aspectN(){const v=$('aspect').value;if(!v)return 0;const a=v=='orig'?cimgW/cimgH:+v;return a*cimgH/cimgW}
+function fitAspect(){const a=aspectN();if(!a)return;let w=1,h=w/a;if(h>1){h=1;w=a}cm.crop=[(1-w)/2,(1-h)/2,w,h];cropBox()}
+$('aspect').onchange=fitAspect;
+CU.onpointerdown=e=>{e.preventDefault();CU.setPointerCapture(e.pointerId);
+ const W=parseFloat(CF.style.width),H=parseFloat(CF.style.height),R=CF.getBoundingClientRect();
+ const px=(e.clientX-R.left)/W,py=(e.clientY-R.top)/H,hd=e.target.dataset&&e.target.dataset.h;
+ drag={h:hd||(e.target==CB?'move':'new'),x0:px,y0:py,c0:[...cm.crop],W,H,R}};
+CU.onpointermove=e=>{if(!drag)return;const {W,H,R,c0}=drag,px=Math.max(0,Math.min(1,(e.clientX-R.left)/W)),py=Math.max(0,Math.min(1,(e.clientY-R.top)/H));
+ let [x,y,w,h]=c0;const a=aspectN(),MIN=.03;
+ if(drag.h=='move'){x=Math.max(0,Math.min(1-w,x+px-drag.x0));y=Math.max(0,Math.min(1-h,y+py-drag.y0))}
+ else{let x1=x,y1=y,x2=x+w,y2=y+h;
+  if(drag.h=='new'){x1=Math.min(drag.x0,px);x2=Math.max(drag.x0,px);y1=Math.min(drag.y0,py);y2=Math.max(drag.y0,py)}
+  else{if(drag.h.includes('w'))x1=Math.min(px,x2-MIN);if(drag.h.includes('e'))x2=Math.max(px,x1+MIN);
+   if(drag.h.includes('n'))y1=Math.min(py,y2-MIN);if(drag.h.includes('s'))y2=Math.max(py,y1+MIN)}
+  w=x2-x1;h=y2-y1;
+  if(a){ // proporción fija: manda el lado que se arrastró
+   if(drag.h=='n'||drag.h=='s')w=h*a;else h=w/a;
+   if(drag.h.includes('w')||(drag.h=='new'&&px<drag.x0))x1=x2-w;if(drag.h.includes('n')||(drag.h=='new'&&py<drag.y0))y1=y2-h;
+   if(x1<0){x1=0;w=x2;h=w/a}if(y1<0){y1=0;h=y2;w=h*a}if(x1+w>1){w=1-x1;h=w/a}if(y1+h>1){h=1-y1;w=h*a}}
+  x=x1;y=y1}
+ cm.crop=[x,y,Math.max(MIN,w),Math.max(MIN,h)];cropBox()};
+CU.onpointerup=CU.onpointercancel=()=>{drag=null};
+let rotTimer=0;
+$('crot').oninput=()=>{cm.rotate=+$('crot').value;$('crotv').textContent=cm.rotate+'°';applyRot();cropBox();
+ CU.classList.add('rotating');clearTimeout(rotTimer);rotTimer=setTimeout(()=>CU.classList.remove('rotating'),700)};
+$('crot').ondblclick=()=>{$('crot').value=0;$('crot').oninput()};
+$('r90l').onclick=()=>{cm.rot90=(cm.rot90+270)%360;cm.crop=[0,0,1,1];cropImage()};
+$('r90r').onclick=()=>{cm.rot90=(cm.rot90+90)%360;cm.crop=[0,0,1,1];cropImage()};
+$('cropfull').onclick=()=>{$('aspect').value='';cm.crop=[0,0,1,1];cropBox()};
+$('upcrop').onchange=()=>{cm.upcrop=$('upcrop').checked?1:0;cropBox()};
+function cropApply(){const g=cmGeom();p.rot90=g.rot90;p.rotate=g.rotate;p.crop=g.crop;p.upcrop=g.upcrop;
+ if(!hasGeom(p)){delete p.crop}cropExit();geomChanged()}
+function geomChanged(){dirty=true;res=0;shown='';A.style.visibility='hidden';safeStale();infoGeom();
+ B.onload=()=>{ar=B.naturalWidth/B.naturalHeight;fit();B.onload=null};load(true)}
+$('cropbtn').onclick=cropEnter;$('cropok').onclick=cropApply;$('cropcancel').onclick=cropExit;
+$('cropclear').onclick=()=>{if(!hasGeom(p))return;p.rot90=0;p.rotate=0;p.crop=null;if(cropping)cropExit();geomChanged();msg('Recorte y rotación quitados (guardá para aplicarlo).')};
+addEventListener('resize',()=>{if(cropping)cropLayout()});
 </script></body></html>"""
 
 

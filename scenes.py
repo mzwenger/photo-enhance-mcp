@@ -92,6 +92,14 @@ def analyze(img: np.ndarray) -> dict:
                 noise=noise, dark_frac=float((L < .25).mean()), bright_frac=float((L > .8).mean()))
 
 
+def _soft(x: np.ndarray, lo: float = .04, hi: float = .96) -> np.ndarray:
+    """Comprime suavemente los extremos en lugar de recortarlos (pie y hombro, como una
+    curva de película): entre lo y hi no cambia nada; por fuera los tonos se acercan a 0 o
+    a 1 sin llegar nunca, así no se pierden gradaciones en sombras ni en luces."""
+    y = np.where(x < lo, lo * np.exp((np.minimum(x, lo) - lo) / lo), x)
+    return np.where(y > hi, 1 - (1 - hi) * np.exp(-(np.maximum(y, hi) - hi) / (1 - hi)), y).astype(np.float32)
+
+
 def _neutral_shift(lab: np.ndarray) -> tuple[float, float]:
     """Tinte estimado con píxeles casi grises (no con el promedio de la foto), para
     que un pasto verde o un cielo azul no se tomen como error de color."""
@@ -140,9 +148,11 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
     r = max(2, round(min(H, W) * .015))  # radio de la capa base, relativo al tamaño
     st = analyze(img)
 
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    L = lab[..., 0] / 255
-    a, b = lab[..., 1] - 128, lab[..., 2] - 128
+    # todo en flotante (Lab de OpenCV en float: L 0-100, a/b centrados en 0): pasar por
+    # 8 bits antes de estirar los tonos deja niveles vacíos (histograma en "peine", bandas)
+    lab = cv2.cvtColor(img.astype(np.float32) / 255, cv2.COLOR_BGR2LAB)
+    L = lab[..., 0] / 100
+    a, b = lab[..., 1], lab[..., 2]
     del lab
 
     # 1) ruido: luminancia con filtro guiado según el ruido medido; color más fuerte
@@ -165,12 +175,11 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
 
     # 3) neblina (en RGB, antes del tono)
     if P["dehaze"] > 0:
-        rgb = cv2.cvtColor(np.dstack([L * 255, a + 128, b + 128]).clip(0, 255).astype(np.uint8),
-                           cv2.COLOR_LAB2RGB).astype(np.float32) / 255
+        rgb = cv2.cvtColor(np.dstack([L * 100, a, b]).astype(np.float32), cv2.COLOR_LAB2RGB).clip(0, 1)
         med0 = float(np.median(L))
         rgb = _dehaze(rgb, P["dehaze"] * k, r)
-        lab2 = cv2.cvtColor((rgb * 255).clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-        L, a, b = lab2[..., 0] / 255, lab2[..., 1] - 128, lab2[..., 2] - 128
+        lab2 = cv2.cvtColor(rgb.astype(np.float32), cv2.COLOR_RGB2LAB)
+        L, a, b = lab2[..., 0] / 100, lab2[..., 1], lab2[..., 2]
         # quitar neblina oscurece: se devuelve el 70% del brillo medio perdido
         med1 = float(np.median(L))
         if .02 < med1 < med0 < .98:
@@ -180,7 +189,7 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
     lo, hi = np.percentile(L, .3), np.percentile(L, 99.8)
     lo = min(lo, .04) * min(k, 1)
     hi = 1 - (1 - max(hi, .9)) * min(k, 1)
-    L = ((L - lo) / max(hi - lo, .2)).clip(0, 1)
+    L = _soft((L - lo) / max(hi - lo, .2))
 
     # 5) base/detalle: la luz se ajusta en la base, el detalle se conserva
     base = _guided(L, L, r, 1e-2)
@@ -188,8 +197,15 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
     med = float(np.median(base))
     if P["exposure"] > 0 and 0.02 < med < .98:
         g = np.log(P["target"]) / np.log(med)  # gamma que lleva la mediana al objetivo
-        g = float(np.clip(1 + (g - 1) * P["exposure"] * k, .6, 1.6))
-        base = base ** g
+        if g > 1:
+            # foto más clara que el objetivo: se oscurece poco (una escena luminosa debe
+            # seguir siéndolo) y solo en medios y luces, para no hundir las sombras
+            g = float(min(1 + (g - 1) * P["exposure"] * k * .4, 1.2))
+            w = np.clip(base / .35, 0, 1) ** 2
+            base = base + (base ** g - base) * w
+        else:
+            g = float(max(1 + (g - 1) * P["exposure"] * k, .6))
+            base = base ** g
     lo0 = float(np.percentile(base, .5))
     sh, hl = P["shadows"] * k, P["highlights"] * k
     base = base + sh * .9 * base * (1 - base) ** 2 - hl * .9 * base ** 2 * (1 - base)
@@ -199,11 +215,11 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
     # los negros vuelven a su nivel: aclarar sombras no debe dejar la foto lavada
     lift = float(np.percentile(base, .5)) - lo0
     if lift > 0:
-        base = ((base - lift) / (1 - lift)).clip(0, 1)
+        base = _soft((base - lift) / (1 - lift))
     # el detalle no crece en zonas planas (ruido) y crece en zonas con textura
     gate = cv2.GaussianBlur(np.abs(detail), (0, 0), 2)
     gate = np.clip(gate / (3 * max(st["noise"], .003)) - .5, 0, 1)
-    L = (base + detail * (1 + P["clarity"] * k * (gate if P["clarity"] > 0 else 1))).clip(0, 1)
+    L = _soft(base + detail * (1 + P["clarity"] * k * (gate if P["clarity"] > 0 else 1)))
     del base, detail, gate
 
     # 6) vibración: más en colores apagados, menos en piel y en lo ya saturado
@@ -219,10 +235,12 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
         hp = L - cv2.GaussianBlur(L, (0, 0), sigma)
         edge = cv2.GaussianBlur(np.abs(hp), (0, 0), sigma)
         mask = np.clip(edge / (2.5 * max(st["noise"], .003)) - 1, 0, 1)
-        L = (L + 1.2 * P["sharpen"] * k * hp * mask).clip(0, 1)
+        L = _soft(L + 1.2 * P["sharpen"] * k * hp * mask)
 
-    out = np.dstack([L * 255, a + 128, b + 128]).clip(0, 255).astype(np.uint8)
-    return cv2.cvtColor(out, cv2.COLOR_LAB2BGR)
+    out = cv2.cvtColor(np.dstack([L * 100, a, b]).astype(np.float32), cv2.COLOR_LAB2BGR)
+    # tramado de medio nivel al volver a 8 bits: evita bandas en cielos y degradados
+    noise = np.random.default_rng(0).uniform(-.5, .5, out.shape[:2])[..., None]
+    return (out * 255 + noise).round().clip(0, 255).astype(np.uint8)
 
 
 # ---------- detección de escena ----------

@@ -1135,8 +1135,10 @@ function drawHist(){const cv=$('hist'),dpr=devicePixelRatio||1,W=cv.clientWidth,
  x.strokeStyle='#ffffff14';for(let q=1;q<4;q++){x.beginPath();x.moveTo(W*q/4,0);x.lineTo(W*q/4,H);x.stroke()}
  const main=hist.mode=='before'?hist.before:hist.after||hist.before,ref=hist.mode=='both'?hist.before:null;
  if(!main){$('hstats').textContent='';return}
- // escala con los valores intermedios, para que un pico en negro o blanco puro no aplaste el resto
- let top=1;for(const a of [main.r,main.g,main.b,main.l])for(let v=3;v<253;v++)top=Math.max(top,a[v]);top*=1.08;
+ // escala robusta: un pico aislado (luces quemadas comprimidas, un cielo liso) no debe aplastar
+ // el resto del gráfico; esos picos se dibujan hasta el borde superior
+ const vals=[];for(const a of [main.r,main.g,main.b,main.l])for(let v=3;v<253;v++)vals.push(a[v]);
+ vals.sort((x,y)=>x-y);let top=Math.max(1,vals[Math.floor(vals.length*.98)]*1.15);
  const path=(a,smooth=true)=>{x.beginPath();x.moveTo(0,H);for(let v=0;v<256;v++){
   const y=smooth&&v>0&&v<255?(a[v-1]+2*a[v]+a[v+1])/4:a[v];x.lineTo(v/255*W,H-Math.min(1,y/top)*(H-2))}x.lineTo(W,H);x.closePath()};
  if(ref&&ref!==main){path(ref.l);x.strokeStyle='#ffffff55';x.setLineDash([3,3]);x.stroke();x.setLineDash([])}

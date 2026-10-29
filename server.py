@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,6 +29,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import cv2
 import numpy as np
 from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from PIL import Image as PILImage, ImageOps
 
 KIT = Path(__file__).resolve().parent
@@ -72,6 +74,11 @@ def _tool(f):
     def run(*args, **kwargs):
         try:
             return f(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as e:
+            # el MCP oculta el texto de las excepciones comunes; el agente necesita el motivo
+            raise ToolError(str(e) or type(e).__name__) from e
         finally:
             _trim_memory()
     return mcp.tool()(run)
@@ -598,6 +605,16 @@ def _params(raw: dict) -> dict:
             out[k] = default
     scene = str(raw.get("scene") or "")
     out["scene"] = scene if scene == "auto" or scene in _scenes().PROFILES else ""
+    # parámetros de perfil propios de una foto (auto_tune); en la URL de la vista previa llegan como JSON
+    sp = raw.get("scene_params")
+    if isinstance(sp, str):
+        try:
+            sp = json.loads(sp)
+        except ValueError:
+            sp = None
+    sp = _scenes().clean_overrides(sp if isinstance(sp, dict) else None)
+    if sp and out["scene"]:
+        out["scene_params"] = sp
     return out
 
 
@@ -635,7 +652,7 @@ def _edit(img: np.ndarray, p: dict, scale: float = 1.0, path=None) -> np.ndarray
     """Aplica los ajustes p. path hace falta solo para resolver scene="auto"."""
     if p.get("scene"):
         scene = _scene_for(path)[0] if p["scene"] == "auto" else p["scene"]
-        img = _scenes().enhance(img, scene, p.get("scene_amount", 1.0), scale)
+        img = _scenes().enhance(img, scene, p.get("scene_amount", 1.0), scale, p.get("scene_params"))
     if p["strength"] > 0:
         img = _enhance(img, p["strength"], scale)
     return _adjust(img, p["brightness"], p["contrast"], p["saturation"], p["warmth"],
@@ -661,6 +678,59 @@ def _base(path: Path, max_side: int) -> tuple[np.ndarray, float]:
         while len(_bases) > 16:
             _bases.popitem(last=False)
     return entry
+
+
+SAFE_SIDE = 480
+SAFE_STEPS = 13
+_NEUTRAL = {"strength": 0, "brightness": 0, "contrast": 0, "saturation": 0, "warmth": 0, "gamma": 1.0,
+            "sharpness": 0, "scene_amount": 0}
+
+
+def _clip_stats(img: np.ndarray) -> tuple[float, float, float]:
+    """% de luces, sombras y color recortados (por canal, como el histograma del visor)."""
+    hi, lo = img >= 253, img <= 2
+    col = (hi.any(2) & ~hi.all(2)) | (lo.any(2) & ~lo.all(2))
+    return float(hi.any(2).mean() * 100), float(lo.any(2).mean() * 100), float(col.mean() * 100)
+
+
+def _post(img: np.ndarray, p: dict, scale: float) -> np.ndarray:
+    """La parte de _edit que va después del perfil de escena (mejora clásica y ajustes)."""
+    if p["strength"] > 0:
+        img = _enhance(img, p["strength"], scale)
+    return _adjust(img, p["brightness"], p["contrast"], p["saturation"], p["warmth"], p["gamma"],
+                   p["sharpness"], scale)
+
+
+def _safe_ranges(path: Path, p: dict) -> dict:
+    """Para cada control, qué valores no agregan recorte de luces, sombras ni color respecto de
+    tenerlo en neutro (con el resto de los ajustes como están). También informa cuánto recorta
+    ya el conjunto actual respecto de la original. Sobre una versión de 480 px."""
+    img, scale = _base(path, SAFE_SIDE)
+    sc = _scenes()
+    scene = (_scene_for(path)[0] if p.get("scene") == "auto" else p.get("scene")) or None
+
+    def scened(amount):
+        return sc.enhance(img, scene, amount, scale, p.get("scene_params")) if scene and amount else img
+
+    def worse(a, b):  # a recorta más que b
+        return a[0] > b[0] + .1 or a[1] > b[1] + .1 or a[2] > b[2] + .2
+
+    stage = scened(p.get("scene_amount", 1.0))  # el perfil se calcula una vez
+    out = {}
+    for k, (default, lo, hi) in _PARAMS.items():
+        if k == "scene_amount" and not scene:
+            continue
+        vals = np.linspace(lo, hi, SAFE_STEPS)
+        if k == "scene_amount":
+            run = lambda v: _post(scened(float(v)), p, scale)
+        else:
+            run = lambda v, k=k: _post(stage, {**p, k: float(v)}, scale)
+        ref = _clip_stats(run(_NEUTRAL[k]))
+        out[k] = {"values": [round(float(v), 4) for v in vals],
+                  "safe": [not worse(_clip_stats(run(v)), ref) for v in vals]}
+    o, c = _clip_stats(img), _clip_stats(_post(stage, p, scale))
+    out["_total"] = {"luces": round(c[0] - o[0], 2), "sombras": round(c[1] - o[1], 2), "color": round(c[2] - o[2], 2)}
+    return out
 
 
 def _viewer_names() -> list[str]:
@@ -806,6 +876,9 @@ class _ViewerHandler(BaseHTTPRequestHandler):
                 path = _viewer["src"] / self._name(q.get("name", ""))
                 img, scale = _base(path, w)
                 self._jpeg(_edit(img, _params(q), scale, path))
+            elif u.path == "/api/safe":
+                path = _viewer["src"] / self._name(q.get("name", ""))
+                self._json(_safe_ranges(path, _params(q)))
             elif u.path == "/api/scene":
                 path = _viewer["src"] / self._name(q.get("name", ""))
                 scene, probs = _scene_for(path)
@@ -890,7 +963,8 @@ def list_presets():
     presets = _presets()
     if not presets:
         return "No hay ajustes guardados."
-    fmt = lambda v: f"{v:g}" if isinstance(v, (int, float)) else (v or "ninguna")
+    fmt = lambda v: (f"{v:g}" if isinstance(v, (int, float)) else
+                     "{" + ", ".join(f"{a}={b:g}" for a, b in v.items()) + "}" if isinstance(v, dict) else (v or "ninguna"))
     return "\n".join(f"{n}: " + ", ".join(f"{k}={fmt(v)}" for k, v in p.items()) for n, p in presets.items())
 
 
@@ -964,7 +1038,13 @@ body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-seri
 #side h3{margin:0 0 10px;font-size:13px}
 .ctl{margin-bottom:12px}.ctl label{display:flex;justify-content:space-between;margin-bottom:3px}
 .ctl label span{color:var(--dim);font-variant-numeric:tabular-nums}
-.ctl input{width:100%}
+.ctl input{width:100%;-webkit-appearance:none;appearance:none;height:16px;background:transparent;margin:0}
+.ctl input::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:var(--safe,#444)}
+.ctl input::-moz-range-track{height:6px;border-radius:3px;background:var(--safe,#444)}
+.ctl input::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#e8e8e8;margin-top:-4px;border:1px solid #222}
+.ctl input::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#e8e8e8;border:1px solid #222}
+#safelegend{color:var(--dim);font-size:12px;margin:-4px 0 10px}
+#safelegend i{display:inline-block;width:10px;height:6px;border-radius:2px;margin:0 3px 1px 0}
 button{background:#333;color:var(--fg);border:1px solid #444;border-radius:5px;padding:6px 10px;cursor:pointer;font:inherit}
 button:hover{background:#3d3d3d}button.pri{background:var(--acc);border-color:var(--acc)}
 .row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
@@ -1000,7 +1080,10 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
  <h3>Perfil de escena</h3>
  <select id="scene"><option value="">Sin perfil</option><option value="auto">Automático (detectar escena)</option></select>
  <div id="scenemsg"></div>
- <h3>Ajustes</h3><div id="ctls"></div>
+ <h3>Ajustes</h3>
+ <div id="safelegend" title="Cada barra muestra lo que agrega ese control respecto de tenerlo en neutro, con el resto como está"><i style="background:#2f8f55"></i>sin pérdida <i style="background:#9a3b3b;margin-left:8px"></i>recorta luces, sombras o color</div>
+ <div id="safewarn" style="color:#e88;font-size:12px;margin:-6px 0 10px"></div>
+ <div id="ctls"></div>
  <div class="row"><button class="pri" id="save">Guardar</button><button id="reset">Restablecer</button></div>
  <div class="row"><button id="copy">Copiar ajustes</button><button id="paste">Pegar</button></div>
  <div id="msg"></div>
@@ -1029,16 +1112,20 @@ function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p
  $('c_scene_amount').closest('.ctl').style.opacity=p.scene?1:.4;pickPreset();if(photos.length)showScene()}
 // el menú muestra el ajuste guardado que coincide con los controles, o queda en blanco
 function pickPreset(){const n=Object.keys(presets).find(n=>{const q={...defs,...presets[n]};
- return CTL.every(([k])=>+q[k]==+p[k])&&(q.scene||'')==(p.scene||'')});$('preset').value=n||''}
+ return CTL.every(([k])=>+q[k]==+p[k])&&(q.scene||'')==(p.scene||'')&&JSON.stringify(q.scene_params||null)==JSON.stringify(p.scene_params||null)});
+ $('preset').value=n||''}
 // perfil de escena: en "auto" se muestra qué escena detectó el servidor
 let sceneLabels={};
 function showScene(){const m=$('scenemsg'),at=i;
- if(!p.scene)return m.textContent='';if(p.scene!='auto')return m.textContent='Perfil aplicado antes de los ajustes.';
+ if(!p.scene)return m.textContent='';
+ if(p.scene_params)return m.textContent='Perfil optimizado para esta foto (auto_tune): '+
+  Object.entries(p.scene_params).map(([k,v])=>`${k} ${+v.toFixed(2)}`).join(', ')+'. Cambiar de perfil lo descarta.';
+ if(p.scene!='auto')return m.textContent='Perfil aplicado antes de los ajustes.';
  m.textContent='Detectando escena…';
  fetch('/api/scene?name='+encodeURIComponent(photos[i].name)).then(r=>r.json()).then(j=>{if(at!=i||p.scene!='auto')return;
   const pr=Object.entries(j.probs||{}).slice(0,3).map(([k,v])=>`${sceneLabels[k]||k} ${Math.round(v*100)}%`).join(' · ');
   m.textContent=`Detectada: ${j.label}. ${pr}`}).catch(()=>m.textContent='No se pudo detectar la escena.')}
-$('scene').onchange=()=>{p.scene=$('scene').value;
+$('scene').onchange=()=>{p.scene=$('scene').value;delete p.scene_params;
  if(p.scene&&p.strength>0){p.strength=0;msg('Mejora automática clásica puesta en 0: el perfil ya incluye esa mejora.')}
  sync();dirty=true;schedule()};
 const msg=t=>$('msg').textContent=t;
@@ -1100,7 +1187,8 @@ function show(k){i=(k+photos.length)%photos.length;const ph=photos[i];
  B.onload=()=>{ar=B.naturalWidth/B.naturalHeight;fit();B.onload=null};load(true)}
 
 function want(){const px=z*fw*devicePixelRatio;return px>4000?8000:px>1700?4000:1600}
-function q(){return CTL.map(([k])=>`${k}=${p[k]}`).join('&')+`&scene=${p.scene||''}`}
+function q(){return CTL.map(([k])=>`${k}=${p[k]}`).join('&')+`&scene=${p.scene||''}`+
+ (p.scene_params?'&scene_params='+encodeURIComponent(JSON.stringify(p.scene_params)):'')}
 function load(force){const w=want();if(!force&&w==res)return;res=w;const n=encodeURIComponent(photos[i].name);
  B.src=`/img/original/${n}?w=${w}`;loadAfter()}
 // Una sola petición a la vez: mientras se mueve un control se pide una vista rápida
@@ -1112,7 +1200,7 @@ function loadAfter(){if(busy){again=true;return}
  $('rtag').textContent=live?'Vista previa':'Editada';
  if(url==shown)return;busy=true;again=false;$('busy').style.display='block';
  const im=new Image();
- im.onload=()=>{if(at==i){A.src=url;shown=url;A.style.visibility='visible';$('err').style.display='none';hist.after=histo(im);drawHist()}done()};
+ im.onload=()=>{if(at==i){A.src=url;shown=url;A.style.visibility='visible';$('err').style.display='none';hist.after=histo(im);drawHist();safeLater()}done()};
  // la imagen no dice por qué falló: se repite el pedido para leer el error, o avisar si el visor está apagado
  im.onerror=()=>{if(at==i)fetch(url).then(r=>r.json()).then(j=>err('No se pudo generar la imagen editada: '+(j.error||'error desconocido')))
   .catch(down);done()};
@@ -1120,22 +1208,40 @@ function loadAfter(){if(busy){again=true;return}
   if(again||at!=i)loadAfter();else if(w<res){clearTimeout(hiTimer);hiTimer=setTimeout(loadAfter,350)}}
  im.src=url}
 function schedule(){clearTimeout(pTimer);pTimer=setTimeout(loadAfter,0)}
+// rangos sin pérdida: el servidor prueba valores de cada control y la barra se pinta verde/rojo
+let sTimer=0,sKey='';
+function safeLater(){clearTimeout(sTimer);sTimer=setTimeout(loadSafe,700)}
+function loadSafe(){const key=photos[i].name+'|'+q();if(key==sKey)return;sKey=key;const at=key;
+ fetch('/api/safe?name='+encodeURIComponent(photos[i].name)+'&'+q()).then(r=>r.json()).then(j=>{if(at!=sKey)return;
+  const t=j._total||{},extra=[['luces',t.luces],['sombras',t.sombras],['color',t.color]].filter(([,v])=>v>.1);
+  $('safewarn').textContent=extra.length?'Con los ajustes actuales ya se recorta más que la original: '+
+   extra.map(([n,v])=>`${n} +${v.toFixed(1)}%`).join(', ')+'.':'';
+  CTL.forEach(([k,,lo,hi])=>{const el=$('c_'+k),d=j[k];if(!d){el.style.removeProperty('--safe');return}
+   const pos=v=>(v-lo)/(hi-lo)*100,step=(d.values[1]-d.values[0])/2,st=[];
+   d.values.forEach((v,n)=>{const c=d.safe[n]?'#2f8f55':'#9a3b3b',a=Math.max(0,pos(v-step)),b=Math.min(100,pos(v+step));st.push(`${c} ${a}%`,`${c} ${b}%`)});
+   el.style.setProperty('--safe',`linear-gradient(to right,${st.join(',')})`)})}).catch(()=>{})}
 function err(t){const e=$('err');e.textContent=t;e.style.display='block'}
 function down(){err('No hay conexión con el visor. Volvé a abrirlo (open_viewer o "python server.py viewer …").')}
 B.onerror=()=>down();
 
 // ---------- histograma ----------
-// Se calcula en el navegador sobre la imagen ya cargada (reducida a ~400 px, alcanza para la forma).
+// Se calcula en el navegador sobre la imagen ya cargada, hasta 1600 px: más chica, las zonas quemadas
+// pequeñas se promedian con sus vecinas y el recorte se subestima.
 const hist={after:null,before:null,mode:'after'};
 B.addEventListener('load',()=>{hist.before=histo(B);if(!A.style.visibility||A.style.visibility=='hidden')hist.after=null;drawHist()});
-function histo(img){const k=Math.min(1,400/Math.max(img.naturalWidth,img.naturalHeight)),
+function histo(img){const k=Math.min(1,1600/Math.max(img.naturalWidth,img.naturalHeight)),
  w=Math.max(1,Math.round(img.naturalWidth*k)),h=Math.max(1,Math.round(img.naturalHeight*k));
  const c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d',{willReadFrequently:true});
  x.drawImage(img,0,0,w,h);const d=x.getImageData(0,0,w,h).data,r=new Float32Array(256),g=new Float32Array(256),
- b=new Float32Array(256),l=new Float32Array(256);let sum=0;
- for(let j=0;j<d.length;j+=4){r[d[j]]++;g[d[j+1]]++;b[d[j+2]]++;const y=Math.round(.2126*d[j]+.7152*d[j+1]+.0722*d[j+2]);l[y]++;sum+=y}
- const n=d.length/4,clip=(a,lo,hi)=>{let s=0;for(let v=lo;v<=hi;v++)s+=a[v];return 100*s/n};
- return {r,g,b,l,n,mean:sum/n,dark:clip(l,0,2),light:clip(l,253,255)}}
+ b=new Float32Array(256),l=new Float32Array(256);let sum=0,hi=0,lo=0,col=0;
+ // recorte por canal (como Lightroom): un cielo con el azul quemado pierde detalle aunque su luminosidad no llegue a 255
+ for(let j=0;j<d.length;j+=4){const R=d[j],G=d[j+1],B=d[j+2];r[R]++;g[G]++;b[B]++;
+  const y=Math.round(.2126*R+.7152*G+.0722*B);l[y]++;sum+=y;
+  const H=R>=253||G>=253||B>=253,L0=R<=2||G<=2||B<=2;if(H)hi++;if(L0)lo++;
+  // color al límite: algún canal en el tope pero no todos -> se perdió el matiz
+  if((H&&!(R>=253&&G>=253&&B>=253))||(L0&&!(R<=2&&G<=2&&B<=2)))col++}
+ const n=d.length/4;
+ return {r,g,b,l,n,mean:sum/n,dark:100*lo/n,light:100*hi/n,color:100*col/n}}
 function drawHist(){const cv=$('hist'),dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
  cv.width=W*dpr;cv.height=H*dpr;const x=cv.getContext('2d');x.scale(dpr,dpr);x.clearRect(0,0,W,H);
  x.strokeStyle='#ffffff14';for(let q=1;q<4;q++){x.beginPath();x.moveTo(W*q/4,0);x.lineTo(W*q/4,H);x.stroke()}
@@ -1156,8 +1262,9 @@ function drawHist(){const cv=$('hist'),dpr=devicePixelRatio||1,W=cv.clientWidth,
  if(main.light>0.5){x.fillStyle='#ff5a5a';x.beginPath();x.moveTo(W-2,2);x.lineTo(W-12,2);x.lineTo(W-2,12);x.fill()}
  const f=v=>v<0.05?'0%':v<10?v.toFixed(1)+'%':Math.round(v)+'%',wrn=(v,t)=>v>0.5?`<b>${t} ${f(v)}</b>`:`${t} ${f(v)}`;
  const ex=main.mean<70?'oscura':main.mean>185?'muy clara':'equilibrada';
- let s=`Brillo medio ${Math.round(main.mean)} de 255 (${ex})<br>${wrn(main.dark,'Sombras recortadas')} · ${wrn(main.light,'luces recortadas')}`;
- if(hist.mode=='both'&&hist.before&&hist.after)s+=`<br>Original: brillo ${Math.round(hist.before.mean)} · sombras ${f(hist.before.dark)} · luces ${f(hist.before.light)}`;
+ let s=`Brillo medio ${Math.round(main.mean)} de 255 (${ex})<br>${wrn(main.dark,'Sombras recortadas')} · ${wrn(main.light,'luces recortadas')}`+
+  `<br>${wrn(main.color,'Color al límite')} <span title="Píxeles con algún canal (R, G o B) en el tope pero no todos: se perdió el matiz">ⓘ</span>`;
+ if(hist.mode=='both'&&hist.before&&hist.after)s+=`<br>Original: brillo ${Math.round(hist.before.mean)} · sombras ${f(hist.before.dark)} · luces ${f(hist.before.light)} · color ${f(hist.before.color)}`;
  $('hstats').innerHTML=s}
 for(const m of ['after','before','both'])$('h_'+m).onclick=()=>{hist.mode=m;
  for(const o of ['after','before','both'])$('h_'+o).classList.toggle('on',o==m);drawHist()};
@@ -1434,6 +1541,211 @@ def best_enhance(path: str, extra_instructions: list[str] | None = None, coloriz
     if found["blanco y negro"] and not colorize_bw:
         msg += "\nEs blanco y negro: usá colorize_bw=true (o la herramienta colorize) para colorearla."
     return [msg, _preview(sheet, 1600)]
+
+
+# ---------- búsqueda automática de parámetros (autotune.py) ----------
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
+_tune_job = {"running": False, "cancel": False, "mode": "", "total": 0, "done": 0, "current": "",
+             "started": 0.0, "dst": "", "results": [], "errors": [], "summary": ""}
+
+
+def _tune_params(scene: str, res: dict) -> dict:
+    """Ajustes completos para guardar: el perfil con sus parámetros propios y el resto neutro."""
+    if not res["amount"]:
+        return _params({"strength": 0})
+    return _params({"strength": 0, "scene": scene, "scene_amount": res["amount"], "scene_params": res["params"]})
+
+
+def _tune_apply(src: Path, dst: Path, name: str, scene: str, res: dict) -> None:
+    if res["amount"]:
+        _apply_one(src, dst, name, _tune_params(scene, res))
+        return
+    # la original ya era la mejor versión: se copia tal cual (sin recomprimir el JPEG)
+    import shutil
+    shutil.copy2(src / name, dst / name)
+    with _ajustes_lock:
+        f = dst / "ajustes.json"
+        saved = json.loads(f.read_text()) if f.is_file() else {}
+        saved[name] = _tune_params(scene, res)
+        f.write_text(json.dumps(saved, indent=1))
+
+
+def _tune_one(path: Path) -> tuple[str, dict, dict]:
+    import autotune
+    scene = _scene_for(path)[0]
+    ref = autotune.Reference(_load(str(path)))
+    res = autotune.tune([ref], scene)
+    return scene, res, ref
+
+
+def _default_dst(src: Path, edited_dir: str | None) -> Path:
+    dst = Path(edited_dir).expanduser() if edited_dir else src / "mejoradas"
+    if dst.resolve() == src.resolve():
+        raise ValueError("La carpeta de salida no puede ser la de los originales")
+    return dst
+
+
+@_tool
+def auto_tune(path: str, apply: bool = False, edited_dir: str | None = None, save_profile: str | None = None):
+    """Analiza una foto y busca sus parámetros óptimos de perfil de escena, con un
+    procedimiento determinista (la misma foto da siempre el mismo resultado): parte del
+    perfil de la escena detectada y prueba combinaciones puntuando calidad, detalle por
+    zona, recortes, tinte en blancos, saturación, brillo por zona y grano al 100%.
+    Tarda ~1-2 min en CPU. Devuelve los parámetros, el porqué y una comparación.
+
+    apply: guarda la versión mejorada a resolución completa en edited_dir (por defecto
+    <carpeta de la foto>/mejoradas) con el mismo nombre; el original nunca se toca y los
+    parámetros quedan en ajustes.json (el visor los respeta).
+    save_profile: además guarda los parámetros como perfil personalizado con ese nombre.
+    """
+    import autotune
+    src = Path(path).expanduser()
+    scene, res, ref = _tune_one(src)
+    sc = _scenes()
+    msg = autotune.report(res, sc.PROFILES[scene])
+    if save_profile:
+        sc.save_profile(save_profile, f"{save_profile} (auto_tune de {src.name})", scene, **res["params"])
+        msg += f"\nGuardado como perfil '{save_profile}'."
+    if apply:
+        dst = _default_dst(src.parent, edited_dir)
+        dst.mkdir(parents=True, exist_ok=True)
+        _tune_apply(src.parent, dst, src.name, scene, res)
+        msg += f"\nVersión mejorada guardada en {dst / src.name} (original intacto)."
+    after = sc.enhance(ref.small, scene, res["amount"], ref.scale, res["params"])
+    gap = np.full((ref.small.shape[0], 8, 3), 255, np.uint8)
+    sheet = np.concatenate([_label(ref.small.copy(), "Original"), gap, _label(after, "auto_tune")], axis=1)
+    return [msg, _preview(sheet, 1600)]
+
+
+def _run_tune_job(src: Path, dst: Path, names: list[str], mode: str, apply: bool, save_profile: str | None):
+    import autotune
+    job = _tune_job
+    try:
+        if mode == "group":
+            # un solo ajuste para el conjunto: escena más común y muestra repartida de hasta 6 fotos
+            scenes = [_scene_for(src / n)[0] for n in names]
+            scene = max(set(scenes), key=lambda x: (scenes.count(x), x))
+            step = max(1, len(names) // 6)
+            sample = names[::step][:6]
+            job["current"] = f"analizando {len(sample)} fotos de muestra (escena {scene})"
+            refs = [autotune.Reference(_load(str(src / n))) for n in sample]
+            res = autotune.tune(refs, scene)
+            job["summary"] = autotune.report(res, _scenes().PROFILES[scene]) + \
+                f"\nMuestra: {', '.join(sample)}. Escenas del grupo: " + \
+                ", ".join(f"{s} {scenes.count(s)}" for s in sorted(set(scenes)))
+            if save_profile:
+                _scenes().save_profile(save_profile, f"{save_profile} (auto_tune de grupo)", scene, **res["params"])
+                job["summary"] += f"\nGuardado como perfil '{save_profile}'."
+            for n in names:
+                if job["cancel"] or not apply:
+                    break
+                job["current"] = n
+                _tune_apply(src, dst, n, scene, res)
+                job["results"].append({"foto": n, "escena": scene})
+                job["done"] += 1
+        else:
+            for n in names:
+                if job["cancel"]:
+                    break
+                job["current"] = n
+                try:
+                    scene, res, _ = _tune_one(src / n)
+                    if apply:
+                        _tune_apply(src, dst, n, scene, res)
+                    base = _scenes().PROFILES[scene]
+                    job["results"].append({
+                        "foto": n, "escena": scene, "antes": round(res["quality_before"], 1),
+                        "despues": round(res["quality_after"], 1), "intensidad": res["amount"],
+                        "cambios": {k: v for k, v in res["params"].items() if abs(v - float(base[k])) > 1e-6}})
+                except Exception as e:
+                    job["errors"].append(f"{n}: {e}")
+                job["done"] += 1
+                _trim_memory()
+    except Exception as e:
+        job["errors"].append(str(e))
+    finally:
+        job["running"] = False
+        job["current"] = ""
+
+
+@_tool
+def auto_tune_batch(original_dir: str, edited_dir: str | None = None, files: list[str] | None = None,
+                    mode: str = "per_photo", apply: bool = True, save_profile: str | None = None):
+    """Busca y aplica los parámetros óptimos a muchas fotos, en segundo plano (no se corta
+    por tiempo). Devuelve enseguida; el progreso se consulta con tune_status.
+
+    mode: "per_photo" (cada foto con sus propios parámetros, ~1-2 min por foto en CPU) o
+    "group" (un solo ajuste óptimo para todo el conjunto, buscado sobre una muestra de hasta
+    6 fotos; después se aplica a todas, mucho más rápido).
+    files: nombres de archivo; si se omite, todas las fotos de original_dir.
+    edited_dir: dónde guardar (por defecto original_dir/mejoradas). Los originales nunca se
+    tocan; si ya había una versión editada con el mismo nombre, se reemplaza.
+    apply: False solo analiza y reporta, sin guardar fotos.
+    save_profile: en modo "group", guarda el ajuste como perfil personalizado.
+    """
+    if _tune_job["running"]:
+        raise RuntimeError("Ya hay una búsqueda en curso; consultala con tune_status o detenela con tune_cancel")
+    if mode not in ("per_photo", "group"):
+        raise ValueError('mode debe ser "per_photo" o "group"')
+    src = Path(original_dir).expanduser()
+    if not src.is_dir():
+        raise FileNotFoundError(f"No existe la carpeta: {src}")
+    dst = _default_dst(src, edited_dir)
+    available = sorted(f.name for f in src.iterdir() if f.suffix.lower() in _IMG_EXTS)
+    names = available if files is None else [Path(f).name for f in files]
+    missing = [n for n in names if n not in available]
+    if missing:
+        raise FileNotFoundError(f"No están en {src}: {', '.join(missing)}")
+    if not names:
+        raise ValueError("No hay fotos para procesar")
+    if apply:
+        dst.mkdir(parents=True, exist_ok=True)
+    _tune_job.update(running=True, cancel=False, mode=mode, total=len(names), done=0, current="",
+                     started=time.time(), dst=str(dst), results=[], errors=[], summary="")
+    threading.Thread(target=_run_tune_job, args=(src, dst, names, mode, apply, save_profile), daemon=True).start()
+    est = f"~{len(names) * 1.5:.0f} min" if mode == "per_photo" else f"~{3 + len(names) * 0.2:.0f} min"
+    return (f"Búsqueda {'por foto' if mode == 'per_photo' else 'de grupo'} iniciada: {len(names)} fotos de {src}"
+            + (f", resultados en {dst}" if apply else " (solo análisis)") + f". Estimado {est}. Consultá con tune_status.")
+
+
+@_tool
+def tune_status(last: int = 10):
+    """Progreso de auto_tune_batch: fotos hechas, tiempo restante estimado, resultados
+    (escena, calidad antes/después y parámetros cambiados) de las últimas `last` fotos."""
+    j = _tune_job
+    if not j["started"]:
+        return "No se inició ninguna búsqueda."
+    el = time.time() - j["started"]
+    state = "en curso" if j["running"] else ("cancelada" if j["cancel"] else "terminada")
+    lines = [f"Búsqueda {state}: {j['done']} de {j['total']} fotos, {el / 60:.1f} min transcurridos"]
+    if j["running"] and j["done"]:
+        lines[0] += f", faltan ~{el / j['done'] * (j['total'] - j['done']) / 60:.0f} min"
+    if j["current"]:
+        lines.append(f"Procesando: {j['current']}")
+    if j["summary"]:
+        lines.append(j["summary"])
+    for r in j["results"][-last:]:
+        if "antes" in r:
+            ch = ("sin cambios (la original era la mejor)" if r.get("intensidad") == 0 else
+                  ", ".join(f"{k} {v:g}" for k, v in r["cambios"].items()) or "perfil sin cambios")
+            if r.get("intensidad") not in (None, 0, 1.0):
+                ch += f", intensidad {r['intensidad'] * 100:.0f}%"
+            lines.append(f"  {r['foto']}: {r['escena']}, calidad {r['antes']} -> {r['despues']}; {ch}")
+    if j["errors"]:
+        lines.append("Errores: " + "; ".join(j["errors"][-5:]))
+    if j["dst"]:
+        lines.append(f"Salida: {j['dst']}")
+    return "\n".join(lines)
+
+
+@_tool
+def tune_cancel():
+    """Detiene auto_tune_batch después de la foto en curso (lo ya guardado queda)."""
+    if not _tune_job["running"]:
+        return "No hay ninguna búsqueda en curso."
+    _tune_job["cancel"] = True
+    return "Se detendrá al terminar la foto en curso."
 
 
 if __name__ == "__main__":

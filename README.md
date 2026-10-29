@@ -15,6 +15,8 @@ opcional vía OpenVINO/Vulkan), sin enviar fotos a ningún servicio.
 | `enhance_scene` | Mejora natural según la escena (nublado, noche, atardecer, interior, contraluz, niebla, retrato, sol fuerte) o detección automática | Filtro guiado + CLIP |
 | `detect_scene`, `list_scenes` | Detecta el tipo de escena (CLIP + EXIF + histograma) | CLIP ViT-B/32 |
 | `save_scene_profile`, `delete_scene_profile` | Perfiles de escena propios con parámetros finos (luces, sombras, calidez, bruma…), guardados en `profiles.json` | — |
+| `auto_tune` | Busca los parámetros óptimos de una foto con un procedimiento determinista (calidad, detalle por zona, recortes, pérdida de color, tinte, grano al 100%) y opcionalmente la guarda; si nada la mejora, la deja igual | autotune.py + pyiqa |
+| `auto_tune_batch`, `tune_status`, `tune_cancel` | Lo mismo para una carpeta o lista de fotos, en segundo plano: cada foto con sus parámetros (`per_photo`) o un ajuste común para el conjunto (`group`). Los originales nunca se tocan | autotune.py |
 | `best_enhance` | Prueba varias combinaciones, las puntúa con IA y aplica la mejor | todas + pyiqa |
 | `ai_retouch` | Retoque de color y exposición aprendido de fotógrafos (MIT-Adobe FiveK) | Image-Adaptive 3D LUT |
 | `ai_restore` | Restauración por instrucción en inglés: ruido, desenfoque, poca luz, neblina, lluvia | InstructIR |
@@ -37,7 +39,8 @@ se modifican: los resultados se guardan aparte.
 ## Visor web
 
 - Deslizador antes/después con zoom y paneo.
-- Histograma RGB y de luminosidad con aviso de sombras/luces recortadas y comparación con la original.
+- Histograma RGB y de luminosidad con recorte de sombras, luces y color medido por canal, y comparación con la original.
+- Cada control muestra en su barra el rango sin pérdida (verde) y dónde empieza a recortar luces, sombras o color (rojo).
 - Perfiles de escena (automático o manual) con intensidad regulable.
 - Controles en vivo: mejora automática, brillo, contraste, saturación, calidez, gamma, nitidez.
 - Ajustes guardados con nombre y aplicación en lote a las fotos seleccionadas.
@@ -109,6 +112,7 @@ Después pedile al agente cosas como *"mejorá las fotos de ~/Fotos/viaje con el
 ```
 server.py       servidor MCP, herramientas clásicas y visor web
 scenes.py       mejora natural por escena y detección de escena
+autotune.py     búsqueda determinista de parámetros óptimos
 ai_enhance.py   3D LUT, InstructIR, DDColor y puntaje de calidad
 ai/instructir/  arquitectura de InstructIR (MIT, ver su LICENSE)
 setup.sh        instalación y descarga de modelos

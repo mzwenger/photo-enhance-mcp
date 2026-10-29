@@ -155,13 +155,19 @@ def analyze(img: np.ndarray) -> dict:
     g = Lc - cv2.GaussianBlur(Lc, (0, 0), 1.0)
     grad = cv2.magnitude(cv2.Sobel(Lc, cv2.CV_32F, 1, 0), cv2.Sobel(Lc, cv2.CV_32F, 0, 1))
     flat = grad < np.percentile(grad, 30)
-    noise = float(1.4826 * np.median(np.abs(g[flat] - np.median(g[flat])))) if flat.any() else 0.0
+    mad = lambda x: float(1.4826 * np.median(np.abs(x - np.median(x)))) if x.size else 0.0
+    noise = mad(g[flat])
+    # ruido de color (a/b de Lab) en las mismas zonas lisas: es otra cosa que el de luminosidad,
+    # y confundir textura de color (pasto, follaje) con ruido borra el detalle de color
+    labc = cv2.cvtColor(crop.astype(np.float32) / 255, cv2.COLOR_BGR2LAB)
+    cn = [mad((ch - cv2.GaussianBlur(ch, (0, 0), 1.0))[flat]) for ch in (labc[..., 1], labc[..., 2])]
     k = min(1.0, 1500 / max(H, W))
     small = cv2.resize(img, (round(W * k), round(H * k)), interpolation=cv2.INTER_AREA) if k < 1 else img
     L = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[..., 0].astype(np.float32) / 255
     return dict(mean=float(L.mean()), median=float(np.median(L)), p01=float(np.percentile(L, 0.5)),
                 p99=float(np.percentile(L, 99.7)), clip_hi=float((L > .98).mean()), clip_lo=float((L < .02).mean()),
-                noise=noise, dark_frac=float((L < .25).mean()), bright_frac=float((L > .8).mean()))
+                noise=noise, chroma_noise=float(np.mean(cn)) if flat.any() else 0.0,
+                dark_frac=float((L < .25).mean()), bright_frac=float((L > .8).mean()))
 
 
 def _soft(x: np.ndarray, lo: float = .04, hi: float = .96) -> np.ndarray:
@@ -209,15 +215,65 @@ def _dehaze(rgb: np.ndarray, amount: float, r: int) -> np.ndarray:
     return rgb + (((rgb - A) / t + A).clip(0, 1) - rgb) * amount
 
 
-def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale: float = 1.0) -> np.ndarray:
-    """Aplica el perfil de escena. scale = ancho de img / ancho de la foto completa."""
+def clean_overrides(raw) -> dict:
+    """Parámetros de perfil válidos (los de RANGES, limitados a su rango)."""
+    out = {}
+    for k, v in (raw or {}).items():
+        if k in RANGES:
+            try:
+                out[k] = float(np.clip(float(v), *RANGES[k]))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _max_chroma_factor(px: np.ndarray, m: float, top: float = 2.0, iters: int = 8) -> np.ndarray:
+    """Para cada color Lab (n, 3): factor máximo de croma (0..top) que entra en sRGB con margen m."""
+    lo = np.zeros(len(px), np.float32)
+    hi = np.full(len(px), top, np.float32)
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        t = np.column_stack([px[:, 0], px[:, 1] * mid, px[:, 2] * mid]).astype(np.float32)
+        rgb = cv2.cvtColor(t[:, None, :], cv2.COLOR_LAB2BGR)[:, 0, :]
+        ok = ((rgb >= m) & (rgb <= 1 - m)).all(1)
+        lo, hi = np.where(ok, mid, lo), np.where(ok, hi, mid)
+    return lo
+
+
+def _gamut_compress(lab: np.ndarray, bgr: np.ndarray, knee: float = .8) -> np.ndarray:
+    """Compresión suave de gama. Un canal pegado a 0 o 255 pierde el matiz y la diferencia entre
+    tonos parecidos; cortarlo (o llevar todos esos colores justo al borde) deja zonas planas.
+    Para los colores cerca del borde se calcula su croma máximo representable (con margen de ~3
+    niveles) y la croma se comprime de forma continua desde el 80% de ese máximo: los colores
+    muy saturados conservan sus diferencias relativas, y la luminosidad y el tono no cambian."""
+    m = 3 / 255
+    near = ((bgr < 24 / 255) | (bgr > 1 - 24 / 255)).any(2)
+    if not near.any():
+        return bgr
+    px = lab[near]
+    fmax = _max_chroma_factor(px, m)              # croma actual * fmax = croma máximo
+    r = 1 / np.maximum(fmax, 1e-4)                # croma actual / croma máximo
+    w = 1 - knee
+    r2 = np.where(r <= knee, r, knee + w * np.tanh((r - knee) / w))
+    f = np.where(r > 0, r2 / np.maximum(r, 1e-6), 1).astype(np.float32)
+    t = np.column_stack([px[:, 0], px[:, 1] * f, px[:, 2] * f]).astype(np.float32)
+    bgr = bgr.copy()
+    bgr[near] = cv2.cvtColor(t[:, None, :], cv2.COLOR_LAB2BGR)[:, 0, :]
+    return bgr
+
+
+def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale: float = 1.0,
+            overrides: dict | None = None, full_width: float | None = None) -> np.ndarray:
+    """Aplica el perfil de escena. scale = ancho de img / ancho de la foto completa.
+    overrides: parámetros que reemplazan los del perfil para esta foto (ver auto_tune).
+    full_width: ancho de la foto completa cuando img es un recorte al 100% (para la nitidez)."""
     sync_profiles()
-    P = PROFILES.get(scene, PROFILES["general"])
+    P = {**PROFILES.get(scene, PROFILES["general"]), **clean_overrides(overrides)}
     k = float(np.clip(amount, 0, 1.5))
     if k == 0:
         return img
     H, W = img.shape[:2]
-    full_w = W / max(scale, 1e-6)
+    full_w = full_width or W / max(scale, 1e-6)
     r = max(2, round(min(H, W) * .015))  # radio de la capa base, relativo al tamaño
     st = analyze(img)
 
@@ -228,15 +284,19 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
     a, b = lab[..., 1], lab[..., 2]
     del lab
 
-    # 1) ruido: luminancia con filtro guiado según el ruido medido; color más fuerte
+    # 1) ruido: luminancia y color por separado, cada uno según su propio ruido medido
     dn = P["denoise"] * k
     if dn > 0 and st["noise"] > .004:
         eps = (st["noise"] * 2.2 * dn) ** 2
         L = _guided(L, L, 1 if dn < 1.5 else 2, eps)
-        rc = max(2, round(r * .5 * dn))
+    # color: solo si hay ruido de color real (más de ~0.6 unidades de a/b en zonas lisas), con
+    # intensidad proporcional; el radio sigue al tamaño de la foto para que la vista previa coincida
+    cmix = float(np.clip((st["chroma_noise"] - .6) / 1.5, 0, 1)) * min(dn, 2) / 2
+    if cmix > 0:
+        rc = max(1, round(r * .25 * min(dn, 2)))
         # eps en unidades de la guía (L, 0-1): bajo para que el color no cruce bordes
-        a = _guided(L, a, rc, 2e-3 * dn)
-        b = _guided(L, b, rc, 2e-3 * dn)
+        a = a + (_guided(L, a, rc, 2e-3) - a) * cmix
+        b = b + (_guided(L, b, rc, 2e-3) - b) * cmix
 
     # 2) color de la luz
     if P["wb"] > 0:
@@ -310,7 +370,8 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
         mask = np.clip(edge / (2.5 * max(st["noise"], .003)) - 1, 0, 1)
         L = _soft(L + 1.2 * P["sharpen"] * k * hp * mask)
 
-    out = cv2.cvtColor(np.dstack([L * 100, a, b]).astype(np.float32), cv2.COLOR_LAB2BGR)
+    lab = np.dstack([L * 100, a, b]).astype(np.float32)
+    out = _gamut_compress(lab, cv2.cvtColor(lab, cv2.COLOR_LAB2BGR))
     # tramado de medio nivel al volver a 8 bits: evita bandas en cielos y degradados
     noise = np.random.default_rng(0).uniform(-.5, .5, out.shape[:2])[..., None]
     return (out * 255 + noise).round().clip(0, 255).astype(np.uint8)

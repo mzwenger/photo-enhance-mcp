@@ -91,6 +91,9 @@ Después pedile al agente cosas como *"mejorá las fotos de ~/Fotos/viaje con el
 
 - **GPU Intel:** `sudo apt install intel-opencl-icd libze-intel-gpu1` y OpenVINO la usa sola.
 - Para forzar un dispositivo: `IMAGE_KIT_DEVICE=CPU|GPU|NPU`.
+- Memoria del servidor: los modelos quedan cargados para responder rápido y se descargan solos
+  cuando el proceso supera `IMAGE_KIT_MAX_RAM_GB` (3 por defecto). Con más RAM, subirlo acelera
+  las llamadas seguidas.
 
 ## Estructura
 

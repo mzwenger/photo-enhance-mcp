@@ -8,6 +8,9 @@ mejor versión; ver ai_enhance.py). La inferencia ONNX corre con OpenVINO en el 
 disponible (GPU/NPU si sus drivers están instalados, si no CPU).
 """
 
+import ctypes
+import functools
+import gc
 import io
 import json
 import os
@@ -33,6 +36,46 @@ REALESRGAN = KIT / "bin" / "realesrgan" / "realesrgan-ncnn-vulkan"
 os.environ.setdefault("U2NET_HOME", str(MODELS / "rembg"))
 
 mcp = MCPServer("image-kit")
+
+# Los modelos quedan cargados para que las llamadas siguientes sean rápidas, pero el servidor
+# vive mucho tiempo: si su memoria supera este límite se descargan (y se recargan al usarlos).
+MAX_RAM_GB = float(os.environ.get("IMAGE_KIT_MAX_RAM_GB", "3"))
+
+
+def _rss_gb() -> float:
+    try:
+        with open("/proc/self/status") as f:
+            return int(f.read().split("VmRSS:")[1].split()[0]) / 1024 / 1024
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
+def _trim_memory() -> None:
+    if _rss_gb() <= MAX_RAM_GB:
+        return
+    with _load_lock:
+        _compiled.clear()
+        _rembg_sessions.clear()
+    for mod in ("ai_enhance", "scenes"):
+        if mod in sys.modules:
+            sys.modules[mod].unload()
+    gc.collect()
+    try:  # devolver al sistema la memoria liberada
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+
+
+def _tool(f):
+    """Registra la herramienta en el MCP y libera modelos al terminar si hace falta."""
+    @functools.wraps(f)
+    def run(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        finally:
+            _trim_memory()
+    return mcp.tool()(run)
+
 
 _ov_core = None
 _compiled = {}
@@ -107,7 +150,7 @@ def _result(img: np.ndarray, out: Path, note: str = ""):
 
 # ---------- herramientas ----------
 
-@mcp.tool()
+@_tool
 def image_info(path: str):
     """Devuelve tamaño, formato y una vista previa de la imagen."""
     p = Path(path).expanduser()
@@ -175,7 +218,7 @@ def _sharpen(img: np.ndarray, amount: float, scale: float = 1.0) -> np.ndarray:
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
-@mcp.tool()
+@_tool
 def auto_enhance(path: str, strength: float = 1.0, output_path: str | None = None):
     """Mejora automática: balance de blancos, contraste local, color y nitidez.
 
@@ -187,7 +230,7 @@ def auto_enhance(path: str, strength: float = 1.0, output_path: str | None = Non
     return _result(img, out)
 
 
-@mcp.tool()
+@_tool
 def adjust(path: str, brightness: float = 0, contrast: float = 0, saturation: float = 0,
            warmth: float = 0, gamma: float = 1.0, sharpness: float = 0,
            output_path: str | None = None):
@@ -202,7 +245,7 @@ def adjust(path: str, brightness: float = 0, contrast: float = 0, saturation: fl
     return _result(img, out)
 
 
-@mcp.tool()
+@_tool
 def denoise(path: str, strength: int = 7, output_path: str | None = None):
     """Reduce el ruido digital conservando bordes. strength 3..20 (7 = moderado)."""
     img = _load(path)
@@ -213,7 +256,7 @@ def denoise(path: str, strength: int = 7, output_path: str | None = None):
     return _result(img, out)
 
 
-@mcp.tool()
+@_tool
 def upscale(path: str, scale: int = 4, style: str = "photo", output_path: str | None = None):
     """Aumenta la resolución con Real-ESRGAN (en la GPU vía Vulkan).
 
@@ -243,7 +286,7 @@ def upscale(path: str, scale: int = 4, style: str = "photo", output_path: str | 
     return _result(img, out)
 
 
-@mcp.tool()
+@_tool
 def remove_background(path: str, background: str | None = None, output_path: str | None = None):
     """Quita el fondo (rembg/ISNet). Sin background deja PNG transparente;
     background acepta un color hex como "#ffffff"."""
@@ -292,7 +335,7 @@ def _lama(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out
 
 
-@mcp.tool()
+@_tool
 def remove_objects(path: str, boxes: list[list[int]] | None = None, mask_path: str | None = None,
                    output_path: str | None = None):
     """Borra objetos y rellena el hueco de forma natural (LaMa).
@@ -328,7 +371,7 @@ _FFHQ = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314
                   [201.26117, 371.41043], [313.08905, 371.15118]], np.float32)
 
 
-@mcp.tool()
+@_tool
 def restore_faces(path: str, fidelity: float = 0.7, output_path: str | None = None):
     """Restaura caras borrosas, pixeladas o de fotos viejas (GFPGAN 1.4).
 
@@ -371,7 +414,7 @@ def restore_faces(path: str, fidelity: float = 0.7, output_path: str | None = No
     return _result(img, out, f"Caras restauradas: {len(faces)}.")
 
 
-@mcp.tool()
+@_tool
 def transform(path: str, crop: list[int] | None = None, width: int | None = None,
               height: int | None = None, rotate: float = 0, flip: str | None = None,
               format: str | None = None, output_path: str | None = None):
@@ -430,7 +473,7 @@ def _stats(img: np.ndarray) -> tuple[float, float, float]:
     return float(gray.mean()), float(sat.mean()), float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-@mcp.tool()
+@_tool
 def compare(original: str, edited: str, mode: str = "side", region: list[int] | None = None,
             output_path: str | None = None):
     """Compara una foto original con su versión editada.
@@ -510,7 +553,7 @@ show(0);
 </script></body></html>"""
 
 
-@mcp.tool()
+@_tool
 def compare_gallery(original_dir: str, edited_dir: str, output_dir: str | None = None,
                     max_side: int = 1600):
     """Crea una página HTML para recorrer y comparar todas las fotos originales con sus
@@ -663,6 +706,7 @@ def _store_preset(name: str, params: dict | None) -> dict:
 
 def _apply_one(src: Path, dst: Path, name: str, p: dict) -> None:
     _save(_edit(_load(str(src / name)), p, path=src / name), dst / name)
+    _trim_memory()
     with _ajustes_lock:
         f = dst / "ajustes.json"
         saved = json.loads(f.read_text()) if f.is_file() else {}
@@ -805,7 +849,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, 500)
 
 
-@mcp.tool()
+@_tool
 def open_viewer(original_dir: str, edited_dir: str, port: int = 8765, open_browser: bool = True):
     """Abre un visor web local para comparar originales con editadas (mismo nombre de
     archivo) con deslizador antes/después, zoom, paneo e histograma, y ajustar en vivo el
@@ -836,7 +880,7 @@ def open_viewer(original_dir: str, edited_dir: str, port: int = 8765, open_brows
     return f"Visor abierto en {url} con {len(_viewer_names())} fotos de {src} (editadas en {dst})."
 
 
-@mcp.tool()
+@_tool
 def list_presets():
     """Lista los ajustes guardados con nombre (los mismos que usa el visor)."""
     presets = _presets()
@@ -846,7 +890,7 @@ def list_presets():
     return "\n".join(f"{n}: " + ", ".join(f"{k}={fmt(v)}" for k, v in p.items()) for n, p in presets.items())
 
 
-@mcp.tool()
+@_tool
 def save_preset(name: str, strength: float | None = None, brightness: float = 0, contrast: float = 0,
                 saturation: float = 0, warmth: float = 0, gamma: float = 1.0, sharpness: float = 0,
                 scene: str = "", scene_amount: float = 1.0):
@@ -864,7 +908,7 @@ def save_preset(name: str, strength: float | None = None, brightness: float = 0,
     return f"Ajuste '{name.strip()}' guardado. Hay {len(p)} ajustes guardados."
 
 
-@mcp.tool()
+@_tool
 def apply_preset(original_dir: str, edited_dir: str, preset: str, files: list[str] | None = None):
     """Aplica un ajuste guardado a varias fotos de original_dir y escribe el resultado
     con el mismo nombre en edited_dir (los originales no se tocan).
@@ -1153,7 +1197,7 @@ def _ai():
     return ai_enhance
 
 
-@mcp.tool()
+@_tool
 def ai_retouch(path: str, strength: float = 1.0, output_path: str | None = None):
     """Retoque automático de exposición y color aprendido de fotógrafos
     profesionales (3D LUT adaptativa, MIT-Adobe FiveK). Rápido y natural.
@@ -1166,7 +1210,7 @@ def ai_retouch(path: str, strength: float = 1.0, output_path: str | None = None)
     return _result(img, out)
 
 
-@mcp.tool()
+@_tool
 def ai_restore(path: str, instruction: str, output_path: str | None = None):
     """Restaura la foto según una instrucción en INGLÉS (InstructIR).
 
@@ -1182,22 +1226,22 @@ def ai_restore(path: str, instruction: str, output_path: str | None = None):
     return _result(img, out, f"El modelo lo interpretó como: {understood}.")
 
 
-@mcp.tool()
+@_tool
 def colorize(path: str, output_path: str | None = None):
     """Colorea una foto en blanco y negro (DDColor), conservando su detalle original."""
-    img = _ai().colorize(_load(path), _model)
+    img = _ai().colorize(_load(path))
     out = _out_path(path, "color", output_path)
     _save(img, out)
     return _result(img, out)
 
 
-@mcp.tool()
+@_tool
 def list_scenes():
     """Lista los perfiles de escena disponibles para enhance_scene y save_preset."""
     return "\n".join(f"{k}: {v['label']}" for k, v in _scenes().PROFILES.items())
 
 
-@mcp.tool()
+@_tool
 def detect_scene(path: str):
     """Detecta el tipo de escena (noche, nublado, atardecer, interior, contraluz,
     niebla, retrato, sol fuerte) con CLIP más datos EXIF y del histograma."""
@@ -1207,7 +1251,7 @@ def detect_scene(path: str):
     return f"Escena: {scene} ({sc.PROFILES[scene]['label']}). Probabilidades: {top}."
 
 
-@mcp.tool()
+@_tool
 def enhance_scene(path: str, scene: str = "auto", amount: float = 1.0, output_path: str | None = None):
     """Mejora natural adaptada a la escena: cada perfil ajusta balance de blancos,
     exposición, sombras/luces sin halos, contraste, neblina, vibración (protege
@@ -1230,7 +1274,7 @@ def enhance_scene(path: str, scene: str = "auto", amount: float = 1.0, output_pa
     return _result(img, out, note + ".")
 
 
-@mcp.tool()
+@_tool
 def score_images(paths: list[str]):
     """Puntúa fotos con IA: calidad técnica (TOPIQ, 0-1: nitidez, ruido,
     exposición), estética (NIMA, 1-10) y un total 0-100. Útil para comparar
@@ -1290,13 +1334,13 @@ def _run(img: np.ndarray, steps: list, scale: float = 1.0) -> np.ndarray:
         elif op == "iir":
             img = ai.instructir(img, _IIR[arg])[0]
         elif op == "color":
-            img = ai.colorize(img, _model)
+            img = ai.colorize(img)
         elif op == "scene":
             img = _scenes().enhance(img, arg[0], arg[1], scale)
     return img
 
 
-@mcp.tool()
+@_tool
 def best_enhance(path: str, extra_instructions: list[str] | None = None, colorize_bw: bool = False,
                  output_path: str | None = None):
     """Mejora automática inteligente: detecta problemas (oscura, ruido, blanco y

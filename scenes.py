@@ -49,21 +49,44 @@ PROFILES = {
 # ---------- bloques ----------
 
 def _guided(I: np.ndarray, p: np.ndarray, r: int, eps: float) -> np.ndarray:
-    """Filtro guiado (He et al.) con guía en escala de grises: suaviza sin cruzar bordes."""
+    """Filtro guiado (He et al.) con guía en escala de grises: suaviza sin cruzar bordes.
+    Con radios grandes usa la versión rápida (He y Sun 2015): los coeficientes se calculan
+    a resolución reducida y se aplican sobre la guía completa. Mismo resultado visual con
+    mucha menos memoria en fotos grandes, y la misma escala en vista previa y guardado."""
+    s = max(1, r // 4)
+    if s > 1:
+        h, w = I.shape[:2]
+        size = (max(1, round(w / s)), max(1, round(h / s)))
+        Is = cv2.resize(I, size, interpolation=cv2.INTER_AREA)
+        ps = cv2.resize(p, size, interpolation=cv2.INTER_AREA)
+        a, b = _guided_coef(Is, ps, max(1, round(r / s)), eps)
+        return cv2.resize(a, (w, h), interpolation=cv2.INTER_LINEAR) * I + cv2.resize(b, (w, h), interpolation=cv2.INTER_LINEAR)
+    a, b = _guided_coef(I, p, r, eps)
+    return a * I + b
+
+
+def _guided_coef(I: np.ndarray, p: np.ndarray, r: int, eps: float) -> tuple[np.ndarray, np.ndarray]:
     box = lambda x: cv2.boxFilter(x, -1, (2 * r + 1, 2 * r + 1))
     mI, mp = box(I), box(p)
     a = (box(I * p) - mI * mp) / (box(I * I) - mI * mI + eps)
     b = mp - a * mI
-    return box(a) * I + box(b)
+    del mI, mp
+    return box(a), box(b)
 
 
 def analyze(img: np.ndarray) -> dict:
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    L = lab[..., 0] / 255
-    g = L - cv2.GaussianBlur(L, (0, 0), 1.0)
-    grad = cv2.magnitude(cv2.Sobel(L, cv2.CV_32F, 1, 0), cv2.Sobel(L, cv2.CV_32F, 0, 1))
+    # el ruido se mide a la resolución de trabajo (un recorte central), el resto en una versión reducida
+    H, W = img.shape[:2]
+    c = 1024
+    crop = img[max(0, (H - c) // 2):(H + c) // 2, max(0, (W - c) // 2):(W + c) // 2]
+    Lc = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)[..., 0].astype(np.float32) / 255
+    g = Lc - cv2.GaussianBlur(Lc, (0, 0), 1.0)
+    grad = cv2.magnitude(cv2.Sobel(Lc, cv2.CV_32F, 1, 0), cv2.Sobel(Lc, cv2.CV_32F, 0, 1))
     flat = grad < np.percentile(grad, 30)
     noise = float(1.4826 * np.median(np.abs(g[flat] - np.median(g[flat])))) if flat.any() else 0.0
+    k = min(1.0, 1500 / max(H, W))
+    small = cv2.resize(img, (round(W * k), round(H * k)), interpolation=cv2.INTER_AREA) if k < 1 else img
+    L = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[..., 0].astype(np.float32) / 255
     return dict(mean=float(L.mean()), median=float(np.median(L)), p01=float(np.percentile(L, 0.5)),
                 p99=float(np.percentile(L, 99.7)), clip_hi=float((L > .98).mean()), clip_lo=float((L < .02).mean()),
                 noise=noise, dark_frac=float((L < .25).mean()), bright_frac=float((L > .8).mean()))
@@ -89,15 +112,21 @@ def _skin_mask(lab: np.ndarray) -> np.ndarray:
 
 
 def _dehaze(rgb: np.ndarray, amount: float, r: int) -> np.ndarray:
-    """Prior del canal oscuro (He et al.) con transmisión refinada por filtro guiado."""
-    dark = cv2.erode(rgb.min(axis=2), np.ones((15, 15), np.uint8))
+    """Prior del canal oscuro (He et al.) con transmisión refinada por filtro guiado.
+    Luz ambiente y transmisión se estiman a ~1000 px (ventana de 15 px a esa escala)."""
+    H, W = rgb.shape[:2]
+    k = min(1.0, 1000 / max(H, W))
+    small = cv2.resize(rgb, (round(W * k), round(H * k)), interpolation=cv2.INTER_AREA) if k < 1 else rgb
+    dark = cv2.erode(small.min(axis=2), np.ones((15, 15), np.uint8))
     flat = dark.ravel()
-    idx = np.argpartition(flat, flat.size - max(1, flat.size // 1000))[-max(1, flat.size // 1000):]
-    A = rgb.reshape(-1, 3)[idx].mean(0).clip(.5, 1)
-    t = 1 - .95 * cv2.erode((rgb / A).min(axis=2), np.ones((15, 15), np.uint8))
-    t = _guided(rgb.mean(2), t.astype(np.float32), r, 1e-3).clip(.35, 1)
-    out = (rgb - A) / t[..., None] + A
-    return rgb + (out.clip(0, 1) - rgb) * amount
+    n = max(1, flat.size // 1000)
+    idx = np.argpartition(flat, flat.size - n)[-n:]
+    A = small.reshape(-1, 3)[idx].mean(0).clip(.5, 1).astype(np.float32)
+    t = (1 - .95 * cv2.erode((small / A).min(axis=2), np.ones((15, 15), np.uint8))).astype(np.float32)
+    if k < 1:
+        t = cv2.resize(t, (W, H), interpolation=cv2.INTER_LINEAR)
+    t = _guided(rgb.mean(2), t, r, 1e-3).clip(.35, 1)[..., None]
+    return rgb + (((rgb - A) / t + A).clip(0, 1) - rgb) * amount
 
 
 def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale: float = 1.0) -> np.ndarray:
@@ -114,6 +143,7 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L = lab[..., 0] / 255
     a, b = lab[..., 1] - 128, lab[..., 2] - 128
+    del lab
 
     # 1) ruido: luminancia con filtro guiado según el ruido medido; color más fuerte
     dn = P["denoise"] * k
@@ -171,9 +201,10 @@ def enhance(img: np.ndarray, scene: str = "general", amount: float = 1.0, scale:
     if lift > 0:
         base = ((base - lift) / (1 - lift)).clip(0, 1)
     # el detalle no crece en zonas planas (ruido) y crece en zonas con textura
-    tex = cv2.GaussianBlur(np.abs(detail), (0, 0), 2)
-    gate = np.clip(tex / (3 * max(st["noise"], .003)) - .5, 0, 1)
+    gate = cv2.GaussianBlur(np.abs(detail), (0, 0), 2)
+    gate = np.clip(gate / (3 * max(st["noise"], .003)) - .5, 0, 1)
     L = (base + detail * (1 + P["clarity"] * k * (gate if P["clarity"] > 0 else 1))).clip(0, 1)
+    del base, detail, gate
 
     # 6) vibración: más en colores apagados, menos en piel y en lo ya saturado
     if P["vibrance"] > 0:
@@ -231,6 +262,11 @@ def _clip_load():
             t /= t.norm(dim=-1, keepdim=True)
         _clip.update(m=model, pre=pre, t=t, names=names)
     return _clip
+
+
+def unload() -> None:
+    with _clip_lock:
+        _clip.clear()
 
 
 def detect_scene(img: np.ndarray, exif: dict | None = None) -> tuple[str, dict]:

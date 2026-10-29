@@ -161,9 +161,21 @@ def instructir(img_bgr: np.ndarray, instruction: str, tile: int = 768) -> tuple[
 
 # ---------- DDColor ----------
 
-def colorize(img_bgr: np.ndarray, compile_model) -> np.ndarray:
+def _ddcolor():
+    # onnxruntime y no OpenVINO: con OpenVINO en CPU ocupa 3.4 GB, con onnxruntime 1.4 GB
+    with _lock:
+        if "ddcolor" not in _cache:
+            import onnxruntime as ort
+            o = ort.SessionOptions()
+            o.enable_cpu_mem_arena = False
+            sess = ort.InferenceSession(str(MODELS / "ddcolor.onnx"), o, providers=["CPUExecutionProvider"])
+            _cache["ddcolor"] = lambda x: {"out": sess.run(None, {sess.get_inputs()[0].name: x})[0]}
+        return _cache["ddcolor"]
+
+
+def colorize(img_bgr: np.ndarray) -> np.ndarray:
     """Colorea una foto en blanco y negro conservando su luminancia original."""
-    net = compile_model("ddcolor.onnx")
+    net = _ddcolor()
     img = img_bgr.astype(np.float32) / 255
     H, W = img.shape[:2]
     orig_l = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)[:, :, :1]
@@ -173,6 +185,12 @@ def colorize(img_bgr: np.ndarray, compile_model) -> np.ndarray:
     ab = cv2.resize(ab, (W, H), interpolation=cv2.INTER_CUBIC)
     out = cv2.cvtColor(np.concatenate([orig_l, ab], -1), cv2.COLOR_LAB2BGR)
     return np.clip(out * 255, 0, 255).round().astype(np.uint8)
+
+
+def unload() -> None:
+    """Libera los modelos cargados (se vuelven a cargar solos si se usan)."""
+    with _lock:
+        _cache.clear()
 
 
 def looks_grayscale(img_bgr: np.ndarray) -> bool:

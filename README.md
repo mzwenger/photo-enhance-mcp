@@ -51,6 +51,8 @@ Abre `http://127.0.0.1:8765/`. También se puede abrir desde el agente con la he
 ## Instalación
 
 Probado en Ubuntu (Linux x86_64). Requiere `curl`, `unzip` y drivers Vulkan para Real-ESRGAN.
+Memoria: 8 GB de RAM como mínimo. Un perfil de escena sobre una foto de 24 MP usa ~4 GB, por eso el
+procesamiento en lote con perfil de escena trabaja de a una foto (sin perfil, de a tres).
 
 ```bash
 git clone https://github.com/mzwenger/photo-enhance-mcp

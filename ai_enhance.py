@@ -11,6 +11,7 @@ Todo se carga recién la primera vez que se usa, para no demorar el arranque del
 import contextlib
 import os
 import sys
+import threading
 from pathlib import Path
 
 import cv2
@@ -20,6 +21,7 @@ KIT = Path(__file__).resolve().parent
 MODELS = KIT / "models"
 
 _cache: dict = {}
+_lock = threading.RLock()  # carga de modelos: una sola vez aunque el lote use varios hilos
 
 
 def _quiet():
@@ -36,6 +38,11 @@ def _torch():
 # ---------- retoque con 3D LUT ----------
 
 def _lut_models():
+    with _lock:
+        return _lut_load()
+
+
+def _lut_load():
     if "lut" not in _cache:
         torch = _torch()
         nn = torch.nn
@@ -83,6 +90,11 @@ def lut_retouch(img_bgr: np.ndarray, strength: float = 1.0) -> np.ndarray:
 # ---------- InstructIR ----------
 
 def _instructir():
+    with _lock:
+        return _instructir_load()
+
+
+def _instructir_load():
     if "iir" not in _cache:
         torch = _torch()
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -174,6 +186,11 @@ METRICS = {"calidad": "topiq_nr", "estetica": "nima"}
 
 
 def _metric(name: str):
+    with _lock:
+        return _metric_load(name)
+
+
+def _metric_load(name: str):
     key = f"iqa:{name}"
     if key not in _cache:
         _torch()

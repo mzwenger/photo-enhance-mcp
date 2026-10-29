@@ -37,6 +37,7 @@ mcp = MCPServer("image-kit")
 _ov_core = None
 _compiled = {}
 _rembg_sessions = {}
+_load_lock = threading.Lock()  # el lote procesa varias fotos a la vez
 
 
 # ---------- utilidades ----------
@@ -51,10 +52,11 @@ def _device() -> str:
 
 
 def _model(name: str):
-    if name not in _compiled:
-        _device()
-        _compiled[name] = _ov_core.compile_model(str(MODELS / name), _device())
-    return _compiled[name]
+    with _load_lock:
+        if name not in _compiled:
+            _device()
+            _compiled[name] = _ov_core.compile_model(str(MODELS / name), _device())
+        return _compiled[name]
 
 
 def _load(path: str) -> np.ndarray:
@@ -136,9 +138,8 @@ def _enhance(img: np.ndarray, strength: float, scale: float = 1.0) -> np.ndarray
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv[..., 1] = np.clip(hsv[..., 1] * (1 + 0.15 * s), 0, 255)
     img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-    # nitidez (unsharp mask)
-    blur = cv2.GaussianBlur(img, (0, 0), max(1.2 * scale, 0.1))
-    return cv2.addWeighted(img, 1 + 0.5 * s, blur, -0.5 * s, 0)
+    # nitidez: mismo enfoque que el control manual, visible igual en vista previa y guardado
+    return _sharpen(img, 0.2 * s, scale)
 
 
 def _adjust(img: np.ndarray, brightness: float = 0, contrast: float = 0, saturation: float = 0,
@@ -180,7 +181,7 @@ def auto_enhance(path: str, strength: float = 1.0, output_path: str | None = Non
 
     strength: 0.0 a 2.0 (1.0 = moderado).
     """
-    img = _enhance(_load(path), strength)
+    img = _enhance(_load(path), float(np.clip(strength, 0, 2)))
     out = _out_path(path, "enhanced", output_path)
     _save(img, out)
     return _result(img, out)
@@ -192,7 +193,10 @@ def adjust(path: str, brightness: float = 0, contrast: float = 0, saturation: fl
            output_path: str | None = None):
     """Ajustes manuales. brightness/contrast/saturation/warmth en -100..100,
     gamma 0.3..3 (<1 aclara sombras), sharpness 0..100."""
-    img = _adjust(_load(path), brightness, contrast, saturation, warmth, gamma, sharpness)
+    p = _params(dict(brightness=brightness, contrast=contrast, saturation=saturation, warmth=warmth,
+                     gamma=gamma, sharpness=sharpness))
+    img = _adjust(_load(path), p["brightness"], p["contrast"], p["saturation"], p["warmth"], p["gamma"],
+                  p["sharpness"])
     out = _out_path(path, "adjusted", output_path)
     _save(img, out)
     return _result(img, out)
@@ -200,9 +204,9 @@ def adjust(path: str, brightness: float = 0, contrast: float = 0, saturation: fl
 
 @mcp.tool()
 def denoise(path: str, strength: int = 7, output_path: str | None = None):
-    """Reduce el ruido digital conservando bordes. strength 3..20."""
+    """Reduce el ruido digital conservando bordes. strength 3..20 (7 = moderado)."""
     img = _load(path)
-    s = int(np.clip(strength, 1, 30))
+    s = int(np.clip(strength, 3, 20))
     img = cv2.fastNlMeansDenoisingColored(img, None, s, s, 7, 21)
     out = _out_path(path, "denoised", output_path)
     _save(img, out)
@@ -244,8 +248,9 @@ def remove_background(path: str, background: str | None = None, output_path: str
     """Quita el fondo (rembg/ISNet). Sin background deja PNG transparente;
     background acepta un color hex como "#ffffff"."""
     from rembg import new_session, remove
-    if "isnet" not in _rembg_sessions:
-        _rembg_sessions["isnet"] = new_session("isnet-general-use")
+    with _load_lock:
+        if "isnet" not in _rembg_sessions:
+            _rembg_sessions["isnet"] = new_session("isnet-general-use")
     rgb = cv2.cvtColor(_load(path), cv2.COLOR_BGR2RGB)
     rgba = np.asarray(remove(PILImage.fromarray(rgb), session=_rembg_sessions["isnet"]))
     img = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
@@ -559,23 +564,33 @@ def _scenes():
 
 
 _scene_cache: OrderedDict = OrderedDict()
+_scene_lock = threading.Lock()
 
 
-def _resolve_scene(img: np.ndarray, scene: str, exif: dict | None = None) -> tuple[str, dict]:
-    """"auto" -> escena detectada (en caché por contenido, para no repetir CLIP en cada vista previa)."""
-    if scene != "auto":
-        return scene, {}
-    key = cv2.resize(img, (16, 16), interpolation=cv2.INTER_AREA).tobytes()
-    if key not in _scene_cache:
-        _scene_cache[key] = _scenes().detect_scene(img, exif)
-        while len(_scene_cache) > 64:
-            _scene_cache.popitem(last=False)
-    return _scene_cache[key]
+def _scene_for(path) -> tuple[str, dict]:
+    """Escena detectada de una foto. Siempre sobre la misma versión (1600 px + EXIF) y en
+    caché por archivo, para que la vista previa, el guardado y el MCP usen la misma escena."""
+    path = Path(path).expanduser()
+    key = (str(path), path.stat().st_mtime)
+    with _scene_lock:
+        if key not in _scene_cache:
+            sc = _scenes()
+            _scene_cache[key] = sc.detect_scene(_base(path, 1600)[0], sc.read_exif(path))
+            while len(_scene_cache) > 256:
+                _scene_cache.popitem(last=False)
+        return _scene_cache[key]
 
 
-def _edit(img: np.ndarray, p: dict, scale: float = 1.0) -> np.ndarray:
+def _check_scene(scene: str) -> str:
+    if scene and scene != "auto" and scene not in _scenes().PROFILES:
+        raise ValueError(f"Escena desconocida '{scene}'. Opciones: auto, {', '.join(_scenes().PROFILES)}")
+    return scene
+
+
+def _edit(img: np.ndarray, p: dict, scale: float = 1.0, path=None) -> np.ndarray:
+    """Aplica los ajustes p. path hace falta solo para resolver scene="auto"."""
     if p.get("scene"):
-        scene, _ = _resolve_scene(img, p["scene"])
+        scene = _scene_for(path)[0] if p["scene"] == "auto" else p["scene"]
         img = _scenes().enhance(img, scene, p.get("scene_amount", 1.0), scale)
     if p["strength"] > 0:
         img = _enhance(img, p["strength"], scale)
@@ -647,7 +662,7 @@ def _store_preset(name: str, params: dict | None) -> dict:
 
 
 def _apply_one(src: Path, dst: Path, name: str, p: dict) -> None:
-    _save(_edit(_load(str(src / name)), p), dst / name)
+    _save(_edit(_load(str(src / name)), p, path=src / name), dst / name)
     with _ajustes_lock:
         f = dst / "ajustes.json"
         saved = json.loads(f.read_text()) if f.is_file() else {}
@@ -665,7 +680,8 @@ def _apply_many(src: Path, dst: Path, names: list[str], p: dict, job: dict | Non
         _apply_one(src, dst, n, p)
         return True
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    # un perfil de escena usa ~4 GB por foto de 24 MP (y ya usa varios núcleos): de a una
+    with ThreadPoolExecutor(max_workers=1 if p.get("scene") else 3) as ex:
         futures = {ex.submit(one, n): n for n in names}
         for f in as_completed(futures):
             saved = False
@@ -742,11 +758,12 @@ class _ViewerHandler(BaseHTTPRequestHandler):
                 self._jpeg(_base(folder / self._name(name), w)[0])
             elif u.path == "/preview":
                 w = int(np.clip(int(q.get("w", 1600)), 200, 8000))
-                img, scale = _base(_viewer["src"] / self._name(q.get("name", "")), w)
-                self._jpeg(_edit(img, _params(q), scale))
+                path = _viewer["src"] / self._name(q.get("name", ""))
+                img, scale = _base(path, w)
+                self._jpeg(_edit(img, _params(q), scale, path))
             elif u.path == "/api/scene":
                 path = _viewer["src"] / self._name(q.get("name", ""))
-                scene, probs = _resolve_scene(_base(path, 1600)[0], "auto", _scenes().read_exif(path))
+                scene, probs = _scene_for(path)
                 self._json({"scene": scene, "label": _scenes().PROFILES[scene]["label"], "probs": probs})
             elif u.path == "/api/presets":
                 self._json(_presets())
@@ -791,8 +808,9 @@ class _ViewerHandler(BaseHTTPRequestHandler):
 @mcp.tool()
 def open_viewer(original_dir: str, edited_dir: str, port: int = 8765, open_browser: bool = True):
     """Abre un visor web local para comparar originales con editadas (mismo nombre de
-    archivo) con deslizador antes/después, zoom y paneo, y ajustar en vivo la mejora
-    automática, brillo, contraste, saturación, calidez, gamma y nitidez. "Guardar" aplica
+    archivo) con deslizador antes/después, zoom, paneo e histograma, y ajustar en vivo el
+    perfil de escena, la mejora automática, brillo, contraste, saturación, calidez, gamma y
+    nitidez (siempre a partir del original, sin acumular ediciones). "Guardar" aplica
     los ajustes a la foto completa y la escribe en edited_dir (los originales no se tocan);
     los ajustes quedan en edited_dir/ajustes.json. Devuelve la URL.
     """
@@ -824,17 +842,22 @@ def list_presets():
     presets = _presets()
     if not presets:
         return "No hay ajustes guardados."
-    return "\n".join(f"{n}: " + ", ".join(f"{k}={v:g}" for k, v in p.items()) for n, p in presets.items())
+    fmt = lambda v: f"{v:g}" if isinstance(v, (int, float)) else (v or "ninguna")
+    return "\n".join(f"{n}: " + ", ".join(f"{k}={fmt(v)}" for k, v in p.items()) for n, p in presets.items())
 
 
 @mcp.tool()
-def save_preset(name: str, strength: float = 0.6, brightness: float = 0, contrast: float = 0,
+def save_preset(name: str, strength: float | None = None, brightness: float = 0, contrast: float = 0,
                 saturation: float = 0, warmth: float = 0, gamma: float = 1.0, sharpness: float = 0,
                 scene: str = "", scene_amount: float = 1.0):
     """Guarda un ajuste con nombre para aplicarlo después a varias fotos.
-    strength es la mejora automática clásica (0..2); el resto como en adjust.
+    strength es la mejora automática clásica (0..2); por defecto 0.6, o 0 si hay escena
+    (el perfil ya incluye esa mejora, igual que en el visor). El resto como en adjust.
     scene: perfil de escena ("auto", "nublado", "noche", … ver list_scenes) o "" para ninguno;
     se aplica antes que los demás ajustes, con intensidad scene_amount (0..1.5)."""
+    _check_scene(scene)
+    if strength is None:
+        strength = 0 if scene else 0.6
     p = _store_preset(name, dict(strength=strength, brightness=brightness, contrast=contrast,
                                  saturation=saturation, warmth=warmth, gamma=gamma, sharpness=sharpness,
                                  scene=scene, scene_amount=scene_amount))
@@ -858,7 +881,7 @@ def apply_preset(original_dir: str, edited_dir: str, preset: str, files: list[st
     if missing:
         raise FileNotFoundError(f"No están en {src}: {', '.join(missing)}")
     dst.mkdir(parents=True, exist_ok=True)
-    errors = _apply_many(src, dst, names, presets[preset])
+    errors = _apply_many(src, dst, names, _params(presets[preset]))
     msg = f"Ajuste '{preset}' aplicado a {len(names) - len(errors)} de {len(names)} fotos en {dst}."
     return msg + ("\nErrores:\n" + "\n".join(errors) if errors else "")
 
@@ -955,7 +978,7 @@ CTL.forEach(([k,l,lo,hi,st])=>{const c=document.createElement('div');c.className
  r.oninput=()=>{p[k]=+r.value;$('v_'+k).textContent=r.value;pickPreset();dirty=true;lastInput=performance.now();schedule()};
  r.ondblclick=()=>{p[k]=defs[k];sync();dirty=true;schedule()}});
 function sync(){CTL.forEach(([k])=>{$('c_'+k).value=p[k];$('v_'+k).textContent=p[k]});$('scene').value=p.scene||'';
- $('c_scene_amount').closest('.ctl').style.opacity=p.scene?1:.4;pickPreset()}
+ $('c_scene_amount').closest('.ctl').style.opacity=p.scene?1:.4;pickPreset();if(photos.length)showScene()}
 // el menú muestra el ajuste guardado que coincide con los controles, o queda en blanco
 function pickPreset(){const n=Object.keys(presets).find(n=>{const q={...defs,...presets[n]};
  return CTL.every(([k])=>+q[k]==+p[k])&&(q.scene||'')==(p.scene||'')});$('preset').value=n||''}
@@ -969,7 +992,7 @@ function showScene(){const m=$('scenemsg'),at=i;
   m.textContent=`Detectada: ${j.label}. ${pr}`}).catch(()=>m.textContent='No se pudo detectar la escena.')}
 $('scene').onchange=()=>{p.scene=$('scene').value;
  if(p.scene&&p.strength>0){p.strength=0;msg('Mejora automática clásica puesta en 0: el perfil ya incluye esa mejora.')}
- sync();dirty=true;schedule();showScene()};
+ sync();dirty=true;schedule()};
 const msg=t=>$('msg').textContent=t;
 
 fetch('/api/list').then(r=>r.json()).then(j=>{photos=j.photos;defs=j.defaults;sceneLabels=j.scenes||{};
@@ -1022,7 +1045,7 @@ fetch('/api/job').then(r=>r.json()).then(j=>{if(j.running)watchJob()}).catch(()=
 function show(k){i=(k+photos.length)%photos.length;const ph=photos[i];
  p={...defs,...(ph.params||{})};sync();dirty=false;res=0;z=1;shown='';A.style.visibility='hidden';
  $('name').textContent=`${ph.name} (${i+1}/${photos.length})`;marks();$('items').children[i].scrollIntoView({block:'nearest'});
- msg(ph.params?'Ajustes guardados con este visor.':ph.edited?'Editada: versión guardada en la carpeta (ajustes desconocidos).':'Sin versión editada todavía.');showScene();
+ msg(ph.params?'Ajustes guardados con este visor.':ph.edited?'Editada: versión guardada en la carpeta (ajustes desconocidos).':'Sin versión editada todavía.');
  fetch('/api/info?name='+encodeURIComponent(ph.name)).then(r=>r.json()).then(j=>{fullW=j.width||fullW;draw()}).catch(down);
  B.onload=()=>{ar=B.naturalWidth/B.naturalHeight;fit();B.onload=null};load(true)}
 
@@ -1179,7 +1202,7 @@ def detect_scene(path: str):
     """Detecta el tipo de escena (noche, nublado, atardecer, interior, contraluz,
     niebla, retrato, sol fuerte) con CLIP más datos EXIF y del histograma."""
     sc = _scenes()
-    scene, probs = sc.detect_scene(_load(path), sc.read_exif(Path(path).expanduser()))
+    scene, probs = _scene_for(path)
     top = ", ".join(f"{k} {v * 100:.0f}%" for k, v in list(probs.items())[:4])
     return f"Escena: {scene} ({sc.PROFILES[scene]['label']}). Probabilidades: {top}."
 
@@ -1194,11 +1217,10 @@ def enhance_scene(path: str, scene: str = "auto", amount: float = 1.0, output_pa
     amount: intensidad 0..1.5 (1 = la del perfil).
     """
     sc = _scenes()
+    if not _check_scene(scene):
+        raise ValueError("Indicá una escena: auto o una de list_scenes")
     img = _load(path)
-    name, probs = (sc.detect_scene(img, sc.read_exif(Path(path).expanduser())) if scene == "auto"
-                   else (scene, {}))
-    if name not in sc.PROFILES:
-        raise ValueError(f"Escena desconocida '{scene}'. Opciones: auto, {', '.join(sc.PROFILES)}")
+    name, probs = _scene_for(path) if scene == "auto" else (scene, {})
     img = sc.enhance(img, name, amount)
     out = _out_path(path, f"scene_{name}", output_path)
     _save(img, out)
@@ -1231,7 +1253,7 @@ _IIR = {"enhance": "Make the colors and contrast look professional",
         "noise": "Remove the noise", "blur": "Fix the blur, make it sharper"}
 
 
-def _recipes(img: np.ndarray, colorize_bw: bool) -> dict:
+def _recipes(img: np.ndarray, colorize_bw: bool, path) -> dict:
     """Combinaciones a probar según lo que se detecta en la foto."""
     ai = _ai()
     r = {"original": [], "auto 0.5": [("auto", 0.5)], "auto 1.0": [("auto", 1.0)],
@@ -1240,7 +1262,7 @@ def _recipes(img: np.ndarray, colorize_bw: bool) -> dict:
     gray = ai.looks_grayscale(img)
     dark = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[..., 0].mean() < 80
     noisy = _noise_sigma(img) > 3.5
-    scene, _ = _resolve_scene(img, "auto")
+    scene, _ = _scene_for(path)
     r[f"escena {scene}"] = [("scene", (scene, 1.0))]
     r[f"escena {scene} 0.6"] = [("scene", (scene, 0.6))]
     if gray and colorize_bw:
@@ -1291,7 +1313,7 @@ def best_enhance(path: str, extra_instructions: list[str] | None = None, coloriz
     h, w = full.shape[:2]
     k = min(1.0, 1024 / max(h, w))
     small = cv2.resize(full, (round(w * k), round(h * k)), interpolation=cv2.INTER_AREA) if k < 1 else full
-    recipes, found = _recipes(small, colorize_bw)
+    recipes, found = _recipes(small, colorize_bw, path)
     for i, ins in enumerate(extra_instructions or []):
         _IIR[f"extra{i}"] = ins
         recipes[f"IIR: {ins[:30]}"] = [("iir", f"extra{i}")]

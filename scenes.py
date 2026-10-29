@@ -12,6 +12,7 @@ histograma.
 
 import contextlib
 import sys
+import threading
 
 import cv2
 import numpy as np
@@ -91,7 +92,7 @@ def _dehaze(rgb: np.ndarray, amount: float, r: int) -> np.ndarray:
     """Prior del canal oscuro (He et al.) con transmisión refinada por filtro guiado."""
     dark = cv2.erode(rgb.min(axis=2), np.ones((15, 15), np.uint8))
     flat = dark.ravel()
-    idx = np.argsort(flat)[-max(1, flat.size // 1000):]
+    idx = np.argpartition(flat, flat.size - max(1, flat.size // 1000))[-max(1, flat.size // 1000):]
     A = rgb.reshape(-1, 3)[idx].mean(0).clip(.5, 1)
     t = 1 - .95 * cv2.erode((rgb / A).min(axis=2), np.ones((15, 15), np.uint8))
     t = _guided(rgb.mean(2), t.astype(np.float32), r, 1e-3).clip(.35, 1)
@@ -207,9 +208,15 @@ PROMPTS = {
     "retrato": ["a portrait photo of a person", "a close-up photo of a person's face"],
 }
 _clip = {}
+_clip_lock = threading.Lock()  # el lote procesa varias fotos a la vez
 
 
 def _clip_model():
+    with _clip_lock:
+        return _clip_load()
+
+
+def _clip_load():
     if "m" not in _clip:
         import clip
         import torch

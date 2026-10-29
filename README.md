@@ -46,7 +46,15 @@ se modifican: los resultados se guardan aparte.
 .venv/bin/python server.py viewer ~/Fotos/viaje ~/Fotos/viaje/mejoradas
 ```
 
-Abre `http://127.0.0.1:8765/`. También se puede abrir desde el agente con la herramienta `open_viewer`.
+Abre `http://127.0.0.1:8765/`. También se puede abrir desde el agente con la herramienta `open_viewer`
+(en ese caso vive mientras viva el servidor MCP).
+
+Para que siga corriendo aunque cierres la terminal o el agente (hasta reiniciar la PC):
+
+```bash
+systemd-run --user --unit=visor-fotos "$PWD/.venv/bin/python" "$PWD/server.py" viewer ~/Fotos/viaje ~/Fotos/viaje/mejoradas
+systemctl --user stop visor-fotos   # para apagarlo
+```
 
 ## Instalación
 

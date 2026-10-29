@@ -1107,7 +1107,9 @@ function loadAfter(){if(busy){again=true;return}
  if(url==shown)return;busy=true;again=false;$('busy').style.display='block';
  const im=new Image();
  im.onload=()=>{if(at==i){A.src=url;shown=url;A.style.visibility='visible';$('err').style.display='none';hist.after=histo(im);drawHist()}done()};
- im.onerror=()=>{if(at==i)err('No se pudo generar la imagen editada.');done()};
+ // la imagen no dice por qué falló: se repite el pedido para leer el error, o avisar si el visor está apagado
+ im.onerror=()=>{if(at==i)fetch(url).then(r=>r.json()).then(j=>err('No se pudo generar la imagen editada: '+(j.error||'error desconocido')))
+  .catch(down);done()};
  function done(){busy=false;$('busy').style.display='none';
   if(again||at!=i)loadAfter();else if(w<res){clearTimeout(hiTimer);hiTimer=setTimeout(loadAfter,350)}}
  im.src=url}

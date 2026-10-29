@@ -110,8 +110,10 @@ def get(url, timeout=120):
 
 def viewer_tests(fotos: Path):
     port = free_port()
+    # la salida va a un archivo: un PIPE sin leer se llena (en Windows con pocos KB) y bloquea al visor
+    logf = open(fotos.parent / "visor.log", "w+", encoding="utf-8", errors="replace")
     proc = subprocess.Popen([PY, str(KIT / "server.py"), "viewer", str(fotos), str(port)],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdout=logf, stderr=subprocess.STDOUT,
                             env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     try:
         base = f"http://127.0.0.1:{port}"
@@ -142,8 +144,9 @@ def viewer_tests(fotos: Path):
                 break
             time.sleep(1)
         r = an.get("result") or {}
-        check(not an.get("error") and r.get("diagnosis") and "amount" in r,
-              f"visor: análisis con IA ({r.get('scene')}, calidad {r.get('quality_before')} -> {r.get('quality_after')})")
+        ok = not an.get("error") and r.get("diagnosis") and "amount" in r
+        check(ok, f"visor: análisis con IA ({r.get('scene')}, calidad {r.get('quality_before')} -> {r.get('quality_after')})"
+              + ("" if ok else f" | en curso={an['running']} progreso={an.get('progress')} error={an.get('error')}"))
         g = "&rot90=90&rotate=3&crop=0.25,0.25,0.5,0.5"
         info = json.loads(get(base + f"/api/info?{q}{g}")[1])
         check(info["upscale"] == 2 and info["final_width"] <= info["orig_width"],
@@ -164,6 +167,11 @@ def viewer_tests(fotos: Path):
             proc.wait(10)
         except subprocess.TimeoutExpired:
             proc.kill()
+        logf.seek(0)
+        out = logf.read()
+        logf.close()
+        if failures:
+            log("--- salida del visor ---\n" + out[-4000:])
 
 
 def main():

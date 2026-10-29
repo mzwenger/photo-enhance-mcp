@@ -23,7 +23,7 @@ opcional vía OpenVINO/Vulkan), sin enviar fotos a ningún servicio.
 | `ai_retouch` | Retoque de color y exposición aprendido de fotógrafos (MIT-Adobe FiveK) | Image-Adaptive 3D LUT |
 | `ai_restore` | Restauración por instrucción en inglés: ruido, desenfoque, poca luz, neblina, lluvia | InstructIR |
 | `colorize` | Colorea fotos en blanco y negro | DDColor |
-| `upscale` | Aumenta la resolución ×2/×3/×4 | Real-ESRGAN (Vulkan) |
+| `upscale` | Aumenta la resolución ×2/×3/×4 con IA (en CPU, sin GPU) | realesr-general-x4v3; Real-ESRGAN x4plus (Vulkan) para ilustraciones |
 | `restore_faces` | Restaura caras borrosas o de fotos viejas | GFPGAN 1.4 + YuNet |
 | `remove_objects` | Borra objetos y rellena el hueco | LaMa |
 | `remove_background` | Quita o reemplaza el fondo | rembg (ISNet) |
@@ -46,7 +46,7 @@ otras versiones. Todas aceptan otra carpeta o ruta de salida si se indica.
 - Deslizador antes/después con zoom y paneo.
 - Histograma RGB y de luminosidad con recorte de sombras, luces y color medido por canal, y comparación con la original.
 - Cada control muestra en su barra: verde sin recorte, amarillo recorte tolerable (manchas chicas y dispersas, como reflejos), rojo recorte visible (zonas continuas, como un cielo quemado) y gris recorte visible causado por otros ajustes. Los umbrales están en `clipping.py`.
-- Recorte y rotación: rectángulo con proporciones fijas (libre, original, 1:1, 4:3, 3:2, 16:9, 4:5, 2:3), enderezado en tiempo real (±45°, sin esquinas vacías) y giros de 90°. Si el recorte deja la foto chica, al guardar se reescala con IA (Real-ESRGAN) hasta cerca del tamaño original. El recorte es de cada foto: no se copia en presets ni en lotes, y los lotes conservan el recorte que ya tenía cada foto.
+- Recorte y rotación: rectángulo con proporciones fijas (libre, original, 1:1, 4:3, 3:2, 16:9, 4:5, 2:3), enderezado en tiempo real (±45°, sin esquinas vacías) y giros de 90°. Si el recorte deja la foto chica, al guardar se reescala hasta cerca del tamaño original: ×2-×3 con Lanczos de alta calidad (comparado contra detalle real, es más fiel que la IA a ese factor) y ×4 con IA (realesr-general-x4v3). El recorte es de cada foto: no se copia en presets ni en lotes, y los lotes conservan el recorte que ya tenía cada foto.
 - Perfiles de escena (automático o manual) con intensidad regulable.
 - Controles en vivo: mejora automática, brillo, contraste, saturación, calidez, gamma, nitidez.
 - Ajustes guardados con nombre y aplicación en lote a las fotos seleccionadas.
@@ -99,8 +99,8 @@ El instalador (`install.py`) instala [uv](https://docs.astral.sh/uv/) si falta, 
 `models/` y `bin/`, incluido Real-ESRGAN para tu sistema. Algunos modelos (CLIP, métricas de pyiqa, el
 codificador de texto de InstructIR) se descargan solos la primera vez que se usan.
 
-Real-ESRGAN usa la GPU por Vulkan (NVIDIA, AMD e Intel tienen drivers con Vulkan). Si no hay Vulkan
-disponible, `upscale` usa un reescalado clásico (Lanczos) y lo avisa en vez de fallar.
+El reescalado de fotos con IA (realesr-general-x4v3) corre en CPU. Real-ESRGAN x4plus, que se usa solo para
+ilustraciones, usa la GPU por Vulkan; si no hay Vulkan, cae a un reescalado clásico y lo avisa.
 
 ### Conectarlo a Claude Code
 

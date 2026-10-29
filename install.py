@@ -33,6 +33,10 @@ MODELS = [
     (f"{GH}/HuiZeng/Image-Adaptive-3DLUT/raw/master/pretrained_models/sRGB/LUTs.pth", "models/lut/LUTs.pth"),
     (f"{GH}/HuiZeng/Image-Adaptive-3DLUT/raw/master/pretrained_models/sRGB/classifier.pth",
      "models/lut/classifier.pth"),
+    (f"{GH}/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+     "models/esrgan/realesr-general-x4v3.pth"),
+    (f"{GH}/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth",
+     "models/esrgan/realesr-general-wdn-x4v3.pth"),
 ]
 ESRGAN = (f"{GH}/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-"
           + ("windows" if WIN else "macos" if MAC else "ubuntu") + ".zip")

@@ -301,7 +301,8 @@ def denoise(path: str, strength: int = 7, output_path: str | None = None):
 
 @_tool
 def upscale(path: str, scale: int = 4, style: str = "photo", output_path: str | None = None):
-    """Aumenta la resolución con Real-ESRGAN (en la GPU vía Vulkan).
+    """Aumenta la resolución con IA: realesr-general-x4v3 en CPU para fotos (conserva colores y
+    texturas naturales) o Real-ESRGAN por Vulkan para ilustraciones.
 
     scale: 2, 3 o 4. style: "photo" o "anime" (ilustraciones/dibujos).
 
@@ -312,7 +313,7 @@ def upscale(path: str, scale: int = 4, style: str = "photo", output_path: str | 
     if scale not in (2, 3, 4):
         raise ValueError("scale debe ser 2, 3 o 4")
     out = _out_path(path, f"x{scale}", output_path, ".png")
-    img, note = _realesrgan(_load(path), scale, style)  # sin Vulkan: Lanczos con aviso
+    img, note = _upscale(_load(path), scale, style)
     _save(img, out)
     return _result(img, out, note)
 
@@ -770,6 +771,24 @@ def _final_size(path: Path, p: dict) -> tuple[int, int]:
     return round(w * k), round(h * k)
 
 
+def _upscale(img: np.ndarray, factor: int, style: str = "photo", crop: bool = False) -> tuple[np.ndarray, str]:
+    """Reescalado según el caso (comparado contra detalle real de fotos de 24 MP):
+    - recortes que necesitan x2/x3: Lanczos + nitidez suave. Más fiel que la IA, que a ese
+      factor inventa texturas que no coinciden con la escena (LPIPS 0.09 contra 0.20 en x2).
+    - x4 y la herramienta upscale: IA realesr-general-x4v3 en CPU (mejor a x4; conserva colores).
+    - ilustraciones (style="anime"): Real-ESRGAN por Vulkan."""
+    h, w = img.shape[:2]
+    if style == "anime":
+        return _realesrgan(img, factor, style)
+    if crop and factor <= 3:
+        return _sharpen(cv2.resize(img, (w * factor, h * factor), interpolation=cv2.INTER_LANCZOS4), .25), ""
+    try:
+        return _ai().upscale_ai(img, factor), ""
+    except Exception as e:  # sin los pesos del modelo, por ejemplo
+        out = _sharpen(cv2.resize(img, (w * factor, h * factor), interpolation=cv2.INTER_LANCZOS4), .25)
+        return out, f"No se pudo usar la IA ({e}): se usó reescalado clásico (Lanczos)."
+
+
 def _realesrgan(img: np.ndarray, factor: int, style: str = "photo") -> tuple[np.ndarray, str]:
     """Reescala con Real-ESRGAN (GPU por Vulkan); si no puede correr, Lanczos. Devuelve la
     imagen y una nota (vacía si se usó Real-ESRGAN)."""
@@ -778,13 +797,7 @@ def _realesrgan(img: np.ndarray, factor: int, style: str = "photo") -> tuple[np.
     if REALESRGAN.is_file():
         with tempfile.TemporaryDirectory() as td:
             src, tmp = Path(td) / "in.png", Path(td) / "out.png"
-            # el modelo de fotos siempre multiplica x4: para x2/x3 se achica antes la entrada, así llega
-            # directo al tamaño final (3-4 veces más rápido que x4 y achicar, y más nítido)
-            inp = img
-            if style != "anime" and factor < 4:
-                inp = cv2.resize(img, (max(1, round(w * factor / 4)), max(1, round(h * factor / 4))),
-                                 interpolation=cv2.INTER_AREA)
-            _save(inp, src)
+            _save(img, src)
             model, s = ((f"realesr-animevideov3-x{factor}", factor) if style == "anime"
                         else ("realesrgan-x4plus", 4))
             r = subprocess.run([str(REALESRGAN), "-i", str(src), "-o", str(tmp), "-n", model, "-s", str(s)],
@@ -1041,7 +1054,7 @@ def _apply_one(src: Path, dst: Path, name: str, p: dict) -> None:
         img = _geom(img, p)
         up = _geom_size(src / name, p)[2]
         if up > 1:  # recorte chico: volver cerca del tamaño original, sin pasarse
-            img = _realesrgan(img, up)[0]
+            img = _upscale(img, up, crop=True)[0]
             fw, fh = _final_size(src / name, p)
             if (img.shape[1], img.shape[0]) != (fw, fh):
                 img = cv2.resize(img, (fw, fh), interpolation=cv2.INTER_AREA)
@@ -1419,7 +1432,7 @@ progress{width:100%;margin:6px 0}#jobmsg{color:var(--dim);min-height:1.2em}
    <option value="0.8">4:5 (vertical)</option><option value="0.6667">2:3 (vertical)</option></select>
   <div class="ctl"><label for="crot">Enderezar<span id="crotv">0°</span></label><div class="trk"><input type="range" id="crot" min="-45" max="45" step="0.1"></div></div>
   <div class="row"><button id="r90l" title="Girar 90° a la izquierda">⟲ 90°</button><button id="r90r" title="Girar 90° a la derecha">⟳ 90°</button><button id="cropfull">Toda la foto</button></div>
-  <label class="chk"><input type="checkbox" id="upcrop" checked> Si el recorte queda chico, reescalarlo con IA al guardar (Real-ESRGAN)</label>
+  <label class="chk"><input type="checkbox" id="upcrop" checked> Si el recorte queda chico, reescalarlo al guardar (×2-3 Lanczos de alta calidad, ×4 con IA)</label>
   <div id="cropsize"></div>
   <div class="row"><button class="pri" id="cropok">Aplicar</button><button id="cropcancel">Cancelar</button></div>
  </div>
@@ -1674,7 +1687,7 @@ onkeydown=e=>{if(cropping){if(e.key=='Enter')cropApply();else if(e.key=='Escape'
 $('reset').onclick=()=>{p={...defs,...geomOf(p)};sync();dirty=true;schedule()};
 $('copy').onclick=()=>{clip=noGeom(p);msg('Ajustes copiados (sin el recorte).')};
 $('paste').onclick=()=>{if(!clip)return msg('Primero copiá ajustes de otra foto.');p={...clip,...geomOf(p)};sync();dirty=true;schedule()};
-$('save').onclick=async()=>{const ph=photos[i];msg(geomUp>1?'Guardando: el recorte se reescala con IA (puede tardar unos minutos)…':'Guardando a resolución completa…');$('save').disabled=true;spinOn('guardando…');
+$('save').onclick=async()=>{const ph=photos[i];msg(geomUp>1?'Guardando: el recorte se reescala…':'Guardando a resolución completa…');$('save').disabled=true;spinOn('guardando…');
  try{const r=await fetch('/api/save',{method:'POST',body:JSON.stringify({name:ph.name,params:p})});const j=await r.json();
   if(!r.ok)throw new Error(j.error);ph.params=j.params;ph.edited=true;dirty=false;ver++;marks();loadAfter();msg('Guardada en la carpeta de editadas.')}
  catch(x){msg('Error al guardar: '+x.message)}finally{$('save').disabled=false;spinOff()}};
@@ -1688,9 +1701,9 @@ function applyRot(){CI.style.transform=`rotate(${cm.rotate}deg) scale(${1/straig
 function infoGeom(g=p,target='cropinfo'){const ph=photos[i];
  fetch('/api/info?name='+encodeURIComponent(ph.name)+gq(g)).then(r=>r.json()).then(j=>{
   if(target=='cropinfo'){fullW=j.width||fullW;geomUp=hasGeom(p)?j.upscale:1;draw();
-   $('cropinfo').textContent=hasGeom(p)?`${j.width}×${j.height} px`+(j.upscale>1?` · al guardar se reescala con IA a ${j.final_width}×${j.final_height}`:''):'Sin recorte ni rotación.'}
+   $('cropinfo').textContent=hasGeom(p)?`${j.width}×${j.height} px`+(j.upscale>1?` · al guardar se reescala${j.upscale>=4?' con IA':''} a ${j.final_width}×${j.final_height}`:''):'Sin recorte ni rotación.'}
   else $('cropsize').textContent=`Resultado: ${j.width}×${j.height} px (${Math.round(100*j.width*j.height/(j.orig_width*j.orig_height))}% del área)`+
-   (j.upscale>1?` → al guardar se reescala con IA a ${j.final_width}×${j.final_height}`:'')}).catch(()=>{})}
+   (j.upscale>1?` → al guardar se reescala${j.upscale>=4?' con IA':''} a ${j.final_width}×${j.final_height}`:'')}).catch(()=>{})}
 function cropEnter(){if(cropping)return;cropping=true;cm={rot90:p.rot90||0,rotate:p.rotate||0,crop:p.crop?[...p.crop]:[0,0,1,1],upcrop:p.upcrop===0?0:1};
  $('crot').value=cm.rotate;$('crotv').textContent=cm.rotate+'°';$('upcrop').checked=!!cm.upcrop;$('aspect').value='';
  S.classList.add('cropping');$('croppanel').hidden=false;$('cropbtn').disabled=true;cropImage()}

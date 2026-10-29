@@ -187,6 +187,39 @@ def colorize(img_bgr: np.ndarray) -> np.ndarray:
     return np.clip(out * 255, 0, 255).round().astype(np.uint8)
 
 
+def _srvgg(denoise: float):
+    key = f"srvgg:{denoise:.2f}"
+    with _lock:
+        if key not in _cache:
+            from ai import srvgg
+            _cache[key] = srvgg.load(MODELS / "esrgan" / "realesr-general-x4v3.pth",
+                                     MODELS / "esrgan" / "realesr-general-wdn-x4v3.pth", denoise)
+        return _cache[key]
+
+
+def upscale_ai(img_bgr: np.ndarray, factor: int, denoise: float = .5, tile: int = 384) -> np.ndarray:
+    """Reescala con realesr-general-x4v3 (x4, en CPU) y lleva al factor pedido. Por mosaicos con
+    solape, para acotar la memoria con fotos grandes."""
+    torch = _torch()
+    net = _srvgg(denoise)
+    h, w = img_bgr.shape[:2]
+    rgb = torch.from_numpy(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)).permute(2, 0, 1)[None].float() / 255
+    out = torch.zeros(1, 3, h * 4, w * 4)
+    pad = 16
+    with torch.no_grad():
+        for y in range(0, h, tile):
+            for x in range(0, w, tile):
+                y0, x0 = max(0, y - pad), max(0, x - pad)
+                y1, x1 = min(h, y + tile + pad), min(w, x + tile + pad)
+                o = net(rgb[:, :, y0:y1, x0:x1])
+                ty, tx = (y - y0) * 4, (x - x0) * 4
+                hh, ww = min(tile, h - y) * 4, min(tile, w - x) * 4
+                out[:, :, y * 4:y * 4 + hh, x * 4:x * 4 + ww] = o[:, :, ty:ty + hh, tx:tx + ww]
+    up = (out[0].clamp(0, 1).permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+    up = cv2.cvtColor(up, cv2.COLOR_RGB2BGR)
+    return up if factor == 4 else cv2.resize(up, (w * factor, h * factor), interpolation=cv2.INTER_AREA)
+
+
 def unload() -> None:
     """Libera los modelos cargados (se vuelven a cargar solos si se usan)."""
     with _lock:

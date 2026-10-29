@@ -71,7 +71,7 @@ def sync_profiles() -> None:
         for k in [k for k in PROFILES if k not in BUILTIN]:
             del PROFILES[k]
         if mtime is not None:
-            for k, v in json.loads(USER_FILE.read_text()).items():
+            for k, v in json.loads(USER_FILE.read_text(encoding="utf-8")).items():
                 if k not in BUILTIN:
                     PROFILES[k] = {**PROFILES["general"], **v, "custom": True}
         _user_mtime = mtime
@@ -96,10 +96,10 @@ def save_profile(key: str, label: str, base: str = "general", **params) -> dict:
     prof["label"] = label.strip() or key
     prof["base"] = base
     with _user_lock:
-        data = json.loads(USER_FILE.read_text()) if USER_FILE.is_file() else {}
+        data = json.loads(USER_FILE.read_text(encoding="utf-8")) if USER_FILE.is_file() else {}
         data[key] = prof
         tmp = USER_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+        tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, USER_FILE)
     sync_profiles()
     return prof
@@ -110,11 +110,11 @@ def delete_profile(key: str) -> None:
     if key in BUILTIN:
         raise ValueError(f"'{key}' es un perfil de fábrica y no se puede borrar")
     with _user_lock:
-        data = json.loads(USER_FILE.read_text()) if USER_FILE.is_file() else {}
+        data = json.loads(USER_FILE.read_text(encoding="utf-8")) if USER_FILE.is_file() else {}
         if key not in data:
             raise ValueError(f"No existe el perfil personalizado '{key}'")
         del data[key]
-        USER_FILE.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+        USER_FILE.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
     sync_profiles()
 
 

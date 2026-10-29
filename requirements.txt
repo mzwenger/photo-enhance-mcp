@@ -10,3 +10,4 @@ rembg>=2.0.60
 pyiqa>=0.1.13
 transformers>=4.40
 openai-clip>=1.0.1
+psutil>=5.9

@@ -1,5 +1,7 @@
 # photo-enhance-mcp
 
+[![Prueba multiplataforma](https://github.com/mzwenger/photo-enhance-mcp/actions/workflows/multiplataforma.yml/badge.svg)](https://github.com/mzwenger/photo-enhance-mcp/actions/workflows/multiplataforma.yml)
+
 Servidor [MCP](https://modelcontextprotocol.io) local para editar y mejorar fotos con IA, más un visor web
 antes/después para ajustar y procesar carpetas enteras. Todo corre en tu computadora (CPU; GPU Intel/NVIDIA
 opcional vía OpenVINO/Vulkan), sin enviar fotos a ningún servicio.
@@ -57,18 +59,25 @@ otras versiones. Todas aceptan otra carpeta o ruta de salida si se indica.
 Abre `http://127.0.0.1:8765/`. También se puede abrir desde el agente con la herramienta `open_viewer`
 (en ese caso vive mientras viva el servidor MCP).
 
-Para que siga corriendo aunque cierres la terminal o el agente (hasta reiniciar la PC):
+En Windows: `.venv\Scripts\python.exe server.py viewer C:\Fotos\viaje`.
+
+Para que siga corriendo aunque cierres la terminal o el agente (hasta reiniciar la PC), en Linux:
 
 ```bash
 systemd-run --user --unit=visor-fotos "$PWD/.venv/bin/python" "$PWD/server.py" viewer ~/Fotos/viaje
 systemctl --user stop visor-fotos   # para apagarlo
 ```
 
+En Windows, sin ventana de consola: `Start-Process .venv\Scripts\pythonw.exe -ArgumentList 'server.py','viewer','C:\Fotos\viaje'`.
+
 ## Instalación
 
-Probado en Ubuntu (Linux x86_64). Requiere `curl`, `unzip` y drivers Vulkan para Real-ESRGAN.
+Funciona en **Linux, Windows y macOS** (x86_64). Cada cambio se prueba automáticamente en Linux y
+Windows con GitHub Actions, instalando desde una carpeta con tildes y eñes en el nombre.
 Memoria: 8 GB de RAM como mínimo. Un perfil de escena sobre una foto de 24 MP usa ~4 GB, por eso el
 procesamiento en lote con perfil de escena trabaja de a una foto (sin perfil, de a tres).
+
+**Linux / macOS**
 
 ```bash
 git clone https://github.com/mzwenger/photo-enhance-mcp
@@ -76,17 +85,38 @@ cd photo-enhance-mcp
 ./setup.sh
 ```
 
-`setup.sh` crea un entorno Python 3.12 con [uv](https://docs.astral.sh/uv/), instala PyTorch para CPU y
-descarga los modelos (~2 GB) en `models/` y `bin/`. Algunos modelos (CLIP, métricas de pyiqa, el
+**Windows** (PowerShell)
+
+```powershell
+git clone https://github.com/mzwenger/photo-enhance-mcp
+cd photo-enhance-mcp
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+El instalador (`install.py`) instala [uv](https://docs.astral.sh/uv/) si falta, crea un entorno Python 3.12
+(no hace falta tener Python instalado), instala PyTorch para CPU y descarga los modelos (~2 GB) en
+`models/` y `bin/`, incluido Real-ESRGAN para tu sistema. Algunos modelos (CLIP, métricas de pyiqa, el
 codificador de texto de InstructIR) se descargan solos la primera vez que se usan.
 
+Real-ESRGAN usa la GPU por Vulkan (NVIDIA, AMD e Intel tienen drivers con Vulkan). Si no hay Vulkan
+disponible, `upscale` usa un reescalado clásico (Lanczos) y lo avisa en vez de fallar.
+
 ### Conectarlo a Claude Code
+
+Linux / macOS:
 
 ```bash
 claude mcp add --scope user photo-enhance -- "$PWD/.venv/bin/python" "$PWD/server.py"
 ```
 
-O agregá a `~/.claude.json`:
+Windows:
+
+```powershell
+claude mcp add --scope user photo-enhance -- "$PWD\.venv\Scripts\python.exe" "$PWD\server.py"
+```
+
+O agregá a `~/.claude.json` (en Windows, `%USERPROFILE%\.claude.json`, con rutas como
+`C:\\Users\\vos\\photo-enhance-mcp\\.venv\\Scripts\\python.exe`):
 
 ```json
 {
@@ -120,7 +150,10 @@ autotune.py     búsqueda determinista de parámetros óptimos
 clipping.py     recorte tolerable vs visible (tamaño de mancha y total por tipo)
 ai_enhance.py   3D LUT, InstructIR, DDColor y puntaje de calidad
 ai/instructir/  arquitectura de InstructIR (MIT, ver su LICENSE)
-setup.sh        instalación y descarga de modelos
+install.py      instalación multiplataforma y descarga de modelos
+setup.sh        instalador para Linux y macOS (instala uv y ejecuta install.py)
+setup.ps1       instalador para Windows
+tests/          prueba de humo (MCP y visor), la misma que corre GitHub Actions
 ```
 
 ## Licencias

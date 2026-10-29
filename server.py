@@ -34,7 +34,7 @@ from PIL import Image as PILImage, ImageOps
 
 KIT = Path(__file__).resolve().parent
 MODELS = KIT / "models"
-REALESRGAN = KIT / "bin" / "realesrgan" / "realesrgan-ncnn-vulkan"
+REALESRGAN = KIT / "bin" / "realesrgan" / ("realesrgan-ncnn-vulkan.exe" if os.name == "nt" else "realesrgan-ncnn-vulkan")
 os.environ.setdefault("U2NET_HOME", str(MODELS / "rembg"))
 
 mcp = MCPServer("image-kit")
@@ -45,10 +45,11 @@ MAX_RAM_GB = float(os.environ.get("IMAGE_KIT_MAX_RAM_GB", "3"))
 
 
 def _rss_gb() -> float:
+    """Memoria del proceso en GB (psutil funciona en Linux, Windows y macOS)."""
     try:
-        with open("/proc/self/status") as f:
-            return int(f.read().split("VmRSS:")[1].split()[0]) / 1024 / 1024
-    except (OSError, IndexError, ValueError):
+        import psutil
+        return psutil.Process().memory_info().rss / 1024 ** 3
+    except Exception:
         return 0.0
 
 
@@ -62,10 +63,11 @@ def _trim_memory() -> None:
         if mod in sys.modules:
             sys.modules[mod].unload()
     gc.collect()
-    try:  # devolver al sistema la memoria liberada
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except OSError:
-        pass
+    if sys.platform.startswith("linux"):  # devolver al sistema la memoria liberada (glibc)
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except OSError:
+            pass
 
 
 def _tool(f):
@@ -107,6 +109,14 @@ def _model(name: str):
             _device()
             _compiled[name] = _ov_core.compile_model(str(MODELS / name), _device())
         return _compiled[name]
+
+
+def _imread(path, flags=cv2.IMREAD_COLOR) -> np.ndarray:
+    """cv2.imread que funciona con rutas con tildes o eñes (en Windows OpenCV no las abre)."""
+    img = cv2.imdecode(np.fromfile(str(path), np.uint8), flags)
+    if img is None:
+        raise FileNotFoundError(f"No se pudo leer la imagen: {path}")
+    return img
 
 
 def _load(path: str) -> np.ndarray:
@@ -302,24 +312,34 @@ def upscale(path: str, scale: int = 4, style: str = "photo", output_path: str | 
     if scale not in (2, 3, 4):
         raise ValueError("scale debe ser 2, 3 o 4")
     out = _out_path(path, f"x{scale}", output_path, ".png")
+    orig = _load(path)
+    h, w = orig.shape[:2]
+    img, note = None, ""
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "in.png"
-        _save(_load(path), src)
+        _save(orig, src)
         if style == "anime":
             model, s = f"realesr-animevideov3-x{scale}", scale
         else:
             model, s = "realesrgan-x4plus", 4
         tmp = Path(td) / "out.png"
-        r = subprocess.run([str(REALESRGAN), "-i", str(src), "-o", str(tmp), "-n", model, "-s", str(s)],
-                           cwd=REALESRGAN.parent, capture_output=True, text=True)
-        if r.returncode != 0 or not tmp.exists():
-            raise RuntimeError(f"Real-ESRGAN falló: {r.stderr[-500:]}")
-        img = cv2.imread(str(tmp))
-        if s != scale:
-            h, w = _load(path).shape[:2]
+        err = "no está instalado"
+        if REALESRGAN.is_file():
+            r = subprocess.run([str(REALESRGAN), "-i", str(src), "-o", str(tmp), "-n", model, "-s", str(s)],
+                               cwd=REALESRGAN.parent, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+            if r.returncode == 0 and tmp.exists():
+                img = _imread(tmp)
+            err = (r.stderr or r.stdout or "")[-300:].strip()
+        if img is not None and s != scale:
             img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_AREA)
+    if img is None:
+        # sin GPU con Vulkan (o sin el binario): reescalado clásico en lugar de fallar
+        img = _sharpen(cv2.resize(orig, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4), .25)
+        note = ("Real-ESRGAN no pudo correr (" + (err.splitlines()[-1] if err else "sin GPU con Vulkan") +
+                "): se usó reescalado clásico (Lanczos), de menor calidad.")
     _save(img, out)
-    return _result(img, out)
+    return _result(img, out, note)
 
 
 @_tool
@@ -389,7 +409,7 @@ def remove_objects(path: str, boxes: list[list[int]] | None = None, mask_path: s
     img = _load(path)
     H, W = img.shape[:2]
     if mask_path:
-        mask = cv2.imread(str(Path(mask_path).expanduser()), cv2.IMREAD_GRAYSCALE)
+        mask = _imread(Path(mask_path).expanduser(), cv2.IMREAD_GRAYSCALE)
         mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
         mask = np.where(mask > 127, 255, 0).astype(np.uint8)
         groups = [mask]
@@ -425,7 +445,8 @@ def restore_faces(path: str, fidelity: float = 0.7, output_path: str | None = No
     """
     img = _load(path)
     H, W = img.shape[:2]
-    det = cv2.FaceDetectorYN.create(str(MODELS / "face_detection_yunet_2023mar.onnx"), "", (W, H), 0.6)
+    det = cv2.FaceDetectorYN.create("onnx", np.fromfile(MODELS / "face_detection_yunet_2023mar.onnx", np.uint8),
+                                    np.array([], np.uint8), (W, H), 0.6)
     _, faces = det.detect(img)
     found = 0 if faces is None else len(faces)
     # con menos de ~40 px el modelo inventa rasgos; mejor reescalar antes
@@ -861,7 +882,7 @@ def _full_width(path: Path) -> int:
 
 def _saved_params() -> dict:
     f = _viewer["dst"] / "ajustes.json"
-    return json.loads(f.read_text()) if f.is_file() else {}
+    return json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}
 
 
 # ---------- ajustes con nombre y aplicación en lote ----------
@@ -872,7 +893,7 @@ _job = {"running": False, "total": 0, "done": 0, "saved": 0, "errors": [], "canc
 
 
 def _presets() -> dict:
-    return json.loads(PRESETS.read_text()) if PRESETS.is_file() else {}
+    return json.loads(PRESETS.read_text(encoding="utf-8")) if PRESETS.is_file() else {}
 
 
 def _store_preset(name: str, params: dict | None) -> dict:
@@ -885,7 +906,7 @@ def _store_preset(name: str, params: dict | None) -> dict:
         presets.pop(name, None)
     else:
         presets[name] = _params(params)
-    PRESETS.write_text(json.dumps(presets, indent=1, ensure_ascii=False))
+    PRESETS.write_text(json.dumps(presets, indent=1, ensure_ascii=False), encoding="utf-8")
     return presets
 
 
@@ -894,9 +915,9 @@ def _apply_one(src: Path, dst: Path, name: str, p: dict) -> None:
     _trim_memory()
     with _ajustes_lock:
         f = dst / "ajustes.json"
-        saved = json.loads(f.read_text()) if f.is_file() else {}
+        saved = json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}
         saved[name] = p
-        f.write_text(json.dumps(saved, indent=1))
+        f.write_text(json.dumps(saved, indent=1), encoding="utf-8")
 
 
 def _apply_many(src: Path, dst: Path, names: list[str], p: dict, job: dict | None = None) -> list[str]:
@@ -1740,9 +1761,9 @@ def _tune_apply(src: Path, dst: Path, name: str, scene: str, res: dict) -> None:
     shutil.copy2(src / name, dst / name)
     with _ajustes_lock:
         f = dst / "ajustes.json"
-        saved = json.loads(f.read_text()) if f.is_file() else {}
+        saved = json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}
         saved[name] = _tune_params(scene, res)
-        f.write_text(json.dumps(saved, indent=1))
+        f.write_text(json.dumps(saved, indent=1), encoding="utf-8")
 
 
 def _tune_one(path: Path) -> tuple[str, dict, dict]:

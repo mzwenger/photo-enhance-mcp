@@ -1,0 +1,57 @@
+name: Prueba multiplataforma
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      KIT: kit-ñandú  # carpeta con eñe y tilde: en Windows es donde aparecen los problemas de rutas
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit-ñandú
+
+      - name: Caché de modelos
+        uses: actions/cache@v4
+        with:
+          path: |
+            kit-ñandú/models
+            kit-ñandú/bin
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/clip
+          key: modelos-${{ runner.os }}-${{ hashFiles('kit-ñandú/install.py') }}
+
+      - name: Instalar (Linux)
+        if: runner.os != 'Windows'
+        working-directory: kit-ñandú
+        run: ./setup.sh
+
+      - name: Instalar (Windows)
+        if: runner.os == 'Windows'
+        working-directory: kit-ñandú
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File setup.ps1
+
+      - name: Prueba de humo (Linux)
+        if: runner.os != 'Windows'
+        working-directory: kit-ñandú
+        run: .venv/bin/python tests/smoke_test.py
+
+      - name: Prueba de humo (Windows)
+        if: runner.os == 'Windows'
+        working-directory: kit-ñandú
+        shell: pwsh
+        run: .venv\Scripts\python.exe tests\smoke_test.py
